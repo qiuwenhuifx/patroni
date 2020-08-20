@@ -22,7 +22,9 @@ _AUTH_ALLOWED_PARAMETERS = (
     'sslcert',
     'sslkey',
     'sslrootcert',
-    'sslcrl'
+    'sslcrl',
+    'gssencmode',
+    'channel_binding'
 )
 
 
@@ -62,6 +64,7 @@ class Config(object):
         'master_stop_timeout': 0,
         'synchronous_mode': False,
         'synchronous_mode_strict': False,
+        'synchronous_node_count': 1,
         'standby_cluster': {
             'create_replica_methods': '',
             'host': '',
@@ -74,7 +77,8 @@ class Config(object):
         'postgresql': {
             'bin_dir': '',
             'use_slots': True,
-            'parameters': CaseInsensitiveDict({p: v[0] for p, v in ConfigHandler.CMDLINE_OPTIONS.items()})
+            'parameters': CaseInsensitiveDict({p: v[0] for p, v in ConfigHandler.CMDLINE_OPTIONS.items()
+                                               if p not in ('wal_keep_segments', 'wal_keep_size')})
         },
         'watchdog': {
             'mode': 'automatic',
@@ -291,6 +295,10 @@ class Config(object):
                 logger.exception('Exception when parsing list %s', value)
                 return None
 
+        _set_section_values('raft', ['data_dir', 'self_addr', 'partner_addrs'])
+        if 'raft' in ret and 'partner_addrs' in ret['raft']:
+            ret['raft']['partner_addrs'] = _parse_list(ret['raft']['partner_addrs'])
+
         for param in list(os.environ.keys()):
             if param.startswith(PATRONI_ENV_PREFIX):
                 # PATRONI_(ETCD|CONSUL|ZOOKEEPER|EXHIBITOR|...)_(HOSTS?|PORT|..)
@@ -298,7 +306,8 @@ class Config(object):
                 if suffix in ('HOST', 'HOSTS', 'PORT', 'USE_PROXIES', 'PROTOCOL', 'SRV', 'URL', 'PROXY',
                               'CACERT', 'CERT', 'KEY', 'VERIFY', 'TOKEN', 'CHECKS', 'DC', 'CONSISTENCY',
                               'REGISTER_SERVICE', 'SERVICE_CHECK_INTERVAL', 'NAMESPACE', 'CONTEXT',
-                              'USE_ENDPOINTS', 'SCOPE_LABEL', 'ROLE_LABEL', 'POD_IP', 'PORTS', 'LABELS') and name:
+                              'USE_ENDPOINTS', 'SCOPE_LABEL', 'ROLE_LABEL', 'POD_IP', 'PORTS', 'LABELS',
+                              'BYPASS_API_SERVICE') and name:
                     value = os.environ.pop(param)
                     if suffix == 'PORT':
                         value = value and parse_int(value)
@@ -306,12 +315,13 @@ class Config(object):
                         value = value and _parse_list(value)
                     elif suffix == 'LABELS':
                         value = _parse_dict(value)
-                    elif suffix in ('USE_PROXIES', 'REGISTER_SERVICE'):
+                    elif suffix in ('USE_PROXIES', 'REGISTER_SERVICE', 'BYPASS_API_SERVICE'):
                         value = parse_bool(value)
                     if value:
                         ret[name.lower()][suffix.lower()] = value
-        if 'etcd' in ret:
-            ret['etcd'].update(_get_auth('etcd'))
+        for dcs in ('etcd', 'etcd3'):
+            if dcs in ret:
+                ret[dcs].update(_get_auth(dcs))
 
         users = {}
         for param in list(os.environ.keys()):
@@ -379,6 +389,7 @@ class Config(object):
             'retry_timeout',
             'synchronous_mode',
             'synchronous_mode_strict',
+            'synchronous_node_count',
         )
 
         pg_config.update({p: config[p] for p in updated_fields if p in config})

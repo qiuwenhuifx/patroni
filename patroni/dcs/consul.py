@@ -54,7 +54,7 @@ class HTTPClient(object):
         if ca_cert:
             kwargs['ca_certs'] = ca_cert
         kwargs['cert_reqs'] = ssl.CERT_REQUIRED if verify or ca_cert else ssl.CERT_NONE
-        self.http = urllib3.PoolManager(num_pools=10, **kwargs)
+        self.http = urllib3.PoolManager(num_pools=10, maxsize=10, **kwargs)
         self._ttl = None
 
     def set_read_timeout(self, timeout):
@@ -219,6 +219,7 @@ class Consul(AbstractDCS):
         self.__session_checks = config.get('checks', [])
         self._register_service = config.get('register_service', False)
         if self._register_service:
+            self._service_tags = config.get('service_tags', [])
             self._service_name = service_name_from_scope_name(self._scope)
             if self._scope != self._service_name:
                 logger.warning('Using %s as consul service name instead of scope name %s', self._service_name,
@@ -367,7 +368,11 @@ class Consul(AbstractDCS):
     def touch_member(self, data, permanent=False):
         cluster = self.cluster
         member = cluster and cluster.get_member(self._name, fallback_to_leader=False)
-        create_member = not permanent and self.refresh_session()
+
+        try:
+            create_member = not permanent and self.refresh_session()
+        except DCSError:
+            return False
 
         if member and (create_member or member.session != self._session):
             self._client.kv.delete(self.member_path)
@@ -410,12 +415,14 @@ class Consul(AbstractDCS):
         conn_parts = urlparse(data['conn_url'])
         check = base.Check.http(api_parts.geturl(), self._service_check_interval,
                                 deregister='{0}s'.format(self._client.http.ttl * 10))
+        tags = self._service_tags[:]
+        tags.append(role)
         params = {
             'service_id': '{0}/{1}'.format(self._scope, self._name),
             'address': conn_parts.hostname,
             'port': conn_parts.port,
             'check': check,
-            'tags': [role]
+            'tags': tags
         }
 
         if state == 'stopped':
@@ -503,7 +510,7 @@ class Consul(AbstractDCS):
         return self._client.kv.put(self.history_path, value)
 
     @catch_consul_errors
-    def delete_leader(self):
+    def _delete_leader(self):
         cluster = self.cluster
         if cluster and isinstance(cluster.leader, Leader) and cluster.leader.name == self._name:
             return self._client.kv.delete(self.leader_path, cas=cluster.leader.index)
