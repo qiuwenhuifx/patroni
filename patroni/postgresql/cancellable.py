@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 
 class CancellableExecutor(object):
 
+    """
+    There must be only one such process so that AsyncExecutor can easily cancel it.
+    """
+
     def __init__(self):
         self._process = None
         self._process_cmd = None
@@ -110,16 +114,20 @@ class CancellableSubprocess(CancellableExecutor):
         with self._lock:
             return self._is_cancelled
 
-    def cancel(self):
+    def cancel(self, kill=False):
         with self._lock:
             self._is_cancelled = True
             if self._process is None or not self._process.is_running():
                 return
+
+            logger.info('Terminating %s', self._process_cmd)
             self._process.terminate()
 
         for _ in polling_loop(10):
             with self._lock:
                 if self._process is None or not self._process.is_running():
                     return
+            if kill:
+                break
 
         self._kill_process()

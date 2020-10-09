@@ -20,8 +20,8 @@ from patroni.postgresql.postmaster import PostmasterProcess
 from patroni.postgresql.slots import SlotsHandler
 from patroni.exceptions import PostgresConnectionException
 from patroni.utils import Retry, RetryFailedError, polling_loop, data_directory_is_empty, parse_int
-from threading import current_thread, Lock
 from psutil import TimeoutExpired
+from threading import current_thread, Lock
 
 
 logger = logging.getLogger(__name__)
@@ -459,6 +459,8 @@ class Postgresql(object):
         self._pending_restart = False
 
         try:
+            if not self._major_version:
+                self.configure_server_parameters()
             configuration = self.config.effective_configuration
         except Exception:
             return None
@@ -698,7 +700,7 @@ class Postgresql(object):
         return True
 
     def get_guc_value(self, name):
-        cmd = [self.pgcommand('postgres'), self._data_dir, '-C', name]
+        cmd = [self.pgcommand('postgres'), '-D', self._data_dir, '-C', name]
         try:
             data = subprocess.check_output(cmd)
             if data:
@@ -795,9 +797,38 @@ class Postgresql(object):
             if data.get('Database cluster state') == 'in production':
                 return True
 
-    def promote(self, wait_seconds, on_success=None, access_is_restricted=False):
+    def _pre_promote(self):
+        """
+        Runs a fencing script after the leader lock is acquired but before the replica is promoted.
+        If the script exits with a non-zero code, promotion does not happen and the leader key is removed from DCS.
+        """
+
+        cmd = self.config.get('pre_promote')
+        if not cmd:
+            return True
+
+        ret = self.cancellable.call(shlex.split(cmd))
+        if ret is not None:
+            logger.info('pre_promote script `%s` exited with %s', cmd, ret)
+        return ret == 0
+
+    def promote(self, wait_seconds, task, on_success=None, access_is_restricted=False):
         if self.role == 'master':
             return True
+
+        ret = self._pre_promote()
+        with task:
+            if task.is_cancelled:
+                return False
+            task.complete(ret)
+
+        if ret is False:
+            return False
+
+        if self.cancellable.is_cancelled:
+            logger.info("PostgreSQL promote cancelled.")
+            return False
+
         ret = self.pg_ctl('promote', '-W')
         if ret:
             self.set_role('master')
@@ -972,8 +1003,11 @@ class Postgresql(object):
     def schedule_sanity_checks_after_pause(self):
         """
             After coming out of pause we have to:
-            1. sync replication slots, because it might happen that slots were removed
-            2. get new 'Database system identifier' to make sure that it wasn't changed
+            1. configure server parameters if necessary
+            2. sync replication slots, because it might happen that slots were removed
+            3. get new 'Database system identifier' to make sure that it wasn't changed
         """
+        if not self._major_version:
+            self.configure_server_parameters()
         self.slots_handler.schedule()
         self._sysid = None
