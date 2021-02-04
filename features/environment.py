@@ -13,6 +13,8 @@ import threading
 import time
 import yaml
 
+from six.moves.BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
+
 
 @six.add_metaclass(abc.ABCMeta)
 class AbstractController(object):
@@ -176,6 +178,7 @@ class PatroniController(AbstractController):
 
         config['name'] = name
         config['postgresql']['data_dir'] = self._data_dir
+        config['postgresql']['basebackup'] = [{'checkpoint': 'fast'}]
         config['postgresql']['use_unix_socket'] = os.name != 'nt'  # windows doesn't yet support unix-domain sockets
         config['postgresql']['pgpass'] = os.path.join(tempfile.gettempdir(), 'pgpass_' + name)
         config['postgresql']['parameters'].update({
@@ -191,6 +194,8 @@ class PatroniController(AbstractController):
         if custom_config is not None:
             self.recursive_update(config, custom_config)
 
+        self.recursive_update(config, {
+            'bootstrap': {'dcs': {'postgresql': {'parameters': {'wal_keep_segments': 100}}}}})
         if config['postgresql'].get('callbacks', {}).get('on_role_change'):
             config['postgresql']['callbacks']['on_role_change'] += ' ' + str(self.__PORT)
 
@@ -558,11 +563,28 @@ class ZooKeeperController(AbstractDcsController):
             return False
 
 
+class MockExhibitor(BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b'{"servers":["127.0.0.1"],"port":2181}')
+
+    def log_message(self, fmt, *args):
+        pass
+
+
 class ExhibitorController(ZooKeeperController):
 
     def __init__(self, context):
         super(ExhibitorController, self).__init__(context, False)
-        os.environ.update({'PATRONI_EXHIBITOR_HOSTS': 'localhost', 'PATRONI_EXHIBITOR_PORT': '8181'})
+        port = 8181
+        exhibitor = HTTPServer(('', port), MockExhibitor)
+        exhibitor.daemon_thread = True
+        exhibitor_thread = threading.Thread(target=exhibitor.serve_forever)
+        exhibitor_thread.daemon = True
+        exhibitor_thread.start()
+        os.environ.update({'PATRONI_EXHIBITOR_HOSTS': 'localhost', 'PATRONI_EXHIBITOR_PORT': str(port)})
 
 
 class RaftController(AbstractDcsController):
@@ -849,8 +871,8 @@ class WatchdogMonitor(object):
 # actions to execute on start/stop of the tests and before running invidual features
 def before_all(context):
     os.environ.update({'PATRONI_RESTAPI_USERNAME': 'username', 'PATRONI_RESTAPI_PASSWORD': 'password'})
-    context.ci = 'TRAVIS_BUILD_NUMBER' in os.environ or 'BUILD_NUMBER' in os.environ
-    context.timeout_multiplier = 2 if context.ci else 1
+    context.ci = any(a in os.environ for a in ('TRAVIS_BUILD_NUMBER', 'BUILD_NUMBER', 'GITHUB_ACTIONS'))
+    context.timeout_multiplier = 5 if context.ci else 1  # MacOS sometimes is VERY slow
     context.pctl = PatroniPoolController(context)
     context.dcs_ctl = context.pctl.known_dcs[context.pctl.dcs](context)
     context.dcs_ctl.start()

@@ -306,7 +306,8 @@ class TestPostgresql(BaseTestPostgresql):
     def test_sync_replication_slots(self):
         self.p.start()
         config = ClusterConfig(1, {'slots': {'test_3': {'database': 'a', 'plugin': 'b'},
-                                             'A': 0, 'ls': 0, 'b': {'type': 'logical', 'plugin': '1'}}}, 1)
+                                             'A': 0, 'ls': 0, 'b': {'type': 'logical', 'plugin': '1'}},
+                                   'ignore_slots': [{'name': 'blabla'}]}, 1)
         cluster = Cluster(True, config, self.leader, 0, [self.me, self.other, self.leadermem], None, None, None)
         with mock.patch('patroni.postgresql.Postgresql._query', Mock(side_effect=psycopg2.OperationalError)):
             self.p.slots_handler.sync_replication_slots(cluster)
@@ -614,32 +615,32 @@ class TestPostgresql(BaseTestPostgresql):
 
         with patch.object(Postgresql, "query", side_effect=[
                     mock_cursor,
-                    [(self.leadermem.name, 'streaming', 'sync'),
-                     (self.me.name, 'streaming', 'async'),
-                     (self.other.name, 'streaming', 'async')]
+                    [(self.leadermem.name, 'sync', 1),
+                     (self.me.name, 'async', 2),
+                     (self.other.name, 'async', 2)]
                 ]):
             self.assertEqual(self.p.pick_synchronous_standby(cluster), ([self.leadermem.name], [self.leadermem.name]))
 
         with patch.object(Postgresql, "query", side_effect=[
                     mock_cursor,
-                    [(self.leadermem.name, 'streaming', 'potential'),
-                     (self.me.name, 'streaming', 'async'),
-                     (self.other.name, 'streaming', 'async')]
+                    [(self.leadermem.name, 'potential', 1),
+                     (self.me.name, 'async', 2),
+                     (self.other.name, 'async', 2)]
                 ]):
             self.assertEqual(self.p.pick_synchronous_standby(cluster), ([self.leadermem.name], []))
 
         with patch.object(Postgresql, "query", side_effect=[
                     mock_cursor,
-                    [(self.me.name, 'streaming', 'async'),
-                     (self.other.name, 'streaming', 'async')]
+                    [(self.me.name, 'async', 1),
+                     (self.other.name, 'async', 2)]
                 ]):
             self.assertEqual(self.p.pick_synchronous_standby(cluster), ([self.me.name], []))
 
         with patch.object(Postgresql, "query", side_effect=[
                     mock_cursor,
-                    [('missing', 'streaming', 'sync'),
-                     (self.me.name, 'streaming', 'async'),
-                     (self.other.name, 'streaming', 'async')]
+                    [('missing', 'sync', 1),
+                     (self.me.name, 'async', 2),
+                     (self.other.name, 'async', 3)]
                 ]):
             self.assertEqual(self.p.pick_synchronous_standby(cluster), ([self.me.name], []))
 
