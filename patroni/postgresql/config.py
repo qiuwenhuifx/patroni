@@ -336,8 +336,9 @@ class ConfigHandler(object):
         if "stats_temp_directory" in self._server_parameters:
             self.try_to_create_dir(self._server_parameters["stats_temp_directory"],
                                    "'{}' is defined in stats_temp_directory, {}")
-        self.try_to_create_dir(os.path.dirname(self._pgpass),
-                               "'{}' is defined in `postgresql.pgpass`, {}")
+        if not self._krbsrvname:
+            self.try_to_create_dir(os.path.dirname(self._pgpass),
+                                   "'{}' is defined in `postgresql.pgpass`, {}")
 
     @property
     def _configuration_to_save(self):
@@ -387,18 +388,18 @@ class ConfigHandler(object):
         if 'custom_conf' not in self._config and not os.path.exists(self._postgresql_base_conf):
             os.rename(self._postgresql_conf, self._postgresql_base_conf)
 
-        # In case we are using custom bootstrap from spilo image with PITR it fails if it contains increasing
-        # values like Max_connections. We disable hot_standby so it will accept increasing values.
-        if self._postgresql.bootstrap.running_custom_bootstrap:
-            configuration['hot_standby'] = 'off'
+        configuration = configuration or self._server_parameters.copy()
+        # Due to the permanent logical replication slots configured we have to enable hot_standby_feedback
+        if self._postgresql.enforce_hot_standby_feedback:
+            configuration['hot_standby_feedback'] = 'on'
 
         with ConfigWriter(self._postgresql_conf) as f:
             include = self._config.get('custom_conf') or self._postgresql_base_conf_name
             f.writeline("include '{0}'\n".format(ConfigWriter.escape(include)))
-            for name, value in sorted((configuration or self._server_parameters).items()):
+            for name, value in sorted((configuration).items()):
                 value = transform_postgresql_parameter_value(self._postgresql.major_version, name, value)
-                if (not self._postgresql.bootstrap.running_custom_bootstrap or name != 'hba_file') \
-                        and name not in self._RECOVERY_PARAMETERS and value is not None:
+                if value is not None and\
+                        (name != 'hba_file' or not self._postgresql.bootstrap.running_custom_bootstrap):
                     f.write_param(name, value)
             # when we are doing custom bootstrap we assume that we don't know superuser password
             # and in order to be able to change it, we are opening trust access from a certain address
@@ -553,7 +554,7 @@ class ConfigHandler(object):
         return os.path.exists(self._recovery_conf)
 
     @property
-    def _triggerfile_good_name(self):
+    def triggerfile_good_name(self):
         return 'trigger_file' if self._postgresql.major_version < 120000 else 'promote_trigger_file'
 
     @property
@@ -756,13 +757,13 @@ class ConfigHandler(object):
         return env
 
     def write_recovery_conf(self, recovery_params):
+        self._recovery_params = recovery_params
         if self._postgresql.major_version >= 120000:
             if parse_bool(recovery_params.pop('standby_mode', None)):
                 open(self._standby_signal, 'w').close()
             else:
                 self._remove_file_if_exists(self._standby_signal)
                 open(self._recovery_signal, 'w').close()
-            self._recovery_params = recovery_params
         else:
             with ConfigWriter(self._recovery_conf) as f:
                 os.chmod(self._recovery_conf, stat.S_IWRITE | stat.S_IREAD)
@@ -806,8 +807,8 @@ class ConfigHandler(object):
 
         if self.get('recovery_conf'):
             value = self._config['recovery_conf'].pop(self._triggerfile_wrong_name, None)
-            if self._triggerfile_good_name not in self._config['recovery_conf'] and value:
-                self._config['recovery_conf'][self._triggerfile_good_name] = value
+            if self.triggerfile_good_name not in self._config['recovery_conf'] and value:
+                self._config['recovery_conf'][self.triggerfile_good_name] = value
 
     def get_server_parameters(self, config):
         parameters = config['parameters'].copy()
@@ -876,25 +877,21 @@ class ConfigHandler(object):
     def resolve_connection_addresses(self):
         port = self._server_parameters['port']
         tcp_local_address = self._get_tcp_local_address()
-
-        local_address = {'port': port}
-        if self._config.get('use_unix_socket'):
-            unix_socket_directories = self._server_parameters.get('unix_socket_directories')
-            if unix_socket_directories is not None:
-                # fallback to tcp if unix_socket_directories is set, but there are no sutable values
-                local_address['host'] = self._get_unix_local_address(unix_socket_directories) or tcp_local_address
-
-            # if unix_socket_directories is not specified, but use_unix_socket is set to true - do our best
-            # to use default value, i.e. don't specify a host neither in connection url nor arguments
-        else:
-            local_address['host'] = tcp_local_address
-
-        self._local_address = local_address
-        self.local_replication_address = {'host': tcp_local_address, 'port': port}
-
         netloc = self._config.get('connect_address') or tcp_local_address + ':' + port
-        self._postgresql.connection_string = uri('postgres', netloc, self._postgresql.database)
 
+        unix_socket_directories = self._server_parameters.get('unix_socket_directories')
+        # fallback to tcp if unix_socket_directories is set, but there are no sutable values
+        unix_local_address = unix_socket_directories and\
+            self._get_unix_local_address(unix_socket_directories) or tcp_local_address
+
+        tcp_local_address = {'host': tcp_local_address, 'port': port}
+        unix_local_address = {'host': unix_local_address, 'port': port}
+
+        self._local_address = unix_local_address if self._config.get('use_unix_socket') else tcp_local_address
+        self.local_replication_address = unix_local_address\
+            if self._config.get('use_unix_socket_repl') else tcp_local_address
+
+        self._postgresql.connection_string = uri('postgres', netloc, self._postgresql.database)
         self._postgresql.set_connection_kwargs(self.local_connect_kwargs)
 
     def _get_pg_settings(self, names):
@@ -1067,6 +1064,14 @@ class ConfigHandler(object):
             if cvalue > value:
                 effective_configuration[name] = cvalue
                 self._postgresql.set_pending_restart(True)
+
+        # If we are using custom bootstrap with PITR it could fail when values
+        # like max_connections are increased, therefore we disable hot_standby.
+        if self._postgresql.bootstrap.running_custom_bootstrap and \
+                (self._postgresql.bootstrap.keep_existing_recovery_conf or self._recovery_conf):
+            effective_configuration['hot_standby'] = 'off'
+            self._postgresql.set_pending_restart(True)
+
         return effective_configuration
 
     @property

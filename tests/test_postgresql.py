@@ -1,4 +1,4 @@
-import mock  # for the mock.call method, importing it without a namespace breaks python3
+import datetime
 import os
 import psutil
 import psycopg2
@@ -8,11 +8,11 @@ import time
 
 from mock import Mock, MagicMock, PropertyMock, patch, mock_open
 from patroni.async_executor import CriticalTask
-from patroni.dcs import Cluster, ClusterConfig, Member, RemoteMember, SyncState
+from patroni.dcs import Cluster, RemoteMember, SyncState
 from patroni.exceptions import PostgresConnectionException, PatroniException
 from patroni.postgresql import Postgresql, STATE_REJECT, STATE_NO_RESPONSE
+from patroni.postgresql.bootstrap import Bootstrap
 from patroni.postgresql.postmaster import PostmasterProcess
-from patroni.postgresql.slots import SlotsHandler
 from patroni.utils import RetryFailedError
 from six.moves import builtins
 from threading import Thread, current_thread
@@ -302,29 +302,6 @@ class TestPostgresql(BaseTestPostgresql):
         m = RemoteMember('1', {'restore_command': '2', 'primary_slot_name': 'foo', 'conn_kwargs': {'host': 'bar'}})
         self.p.follow(m)
 
-    @patch.object(Postgresql, 'is_running', Mock(return_value=True))
-    def test_sync_replication_slots(self):
-        self.p.start()
-        config = ClusterConfig(1, {'slots': {'test_3': {'database': 'a', 'plugin': 'b'},
-                                             'A': 0, 'ls': 0, 'b': {'type': 'logical', 'plugin': '1'}},
-                                   'ignore_slots': [{'name': 'blabla'}]}, 1)
-        cluster = Cluster(True, config, self.leader, 0, [self.me, self.other, self.leadermem], None, None, None)
-        with mock.patch('patroni.postgresql.Postgresql._query', Mock(side_effect=psycopg2.OperationalError)):
-            self.p.slots_handler.sync_replication_slots(cluster)
-        self.p.slots_handler.sync_replication_slots(cluster)
-        with mock.patch('patroni.postgresql.Postgresql.role', new_callable=PropertyMock(return_value='replica')):
-            self.p.slots_handler.sync_replication_slots(cluster)
-        with patch.object(SlotsHandler, 'drop_replication_slot', Mock(return_value=True)),\
-                patch('patroni.dcs.logger.error', new_callable=Mock()) as errorlog_mock:
-            alias1 = Member(0, 'test-3', 28, {'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres'})
-            alias2 = Member(0, 'test.3', 28, {'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5436/postgres'})
-            cluster.members.extend([alias1, alias2])
-            self.p.slots_handler.sync_replication_slots(cluster)
-            self.assertEqual(errorlog_mock.call_count, 5)
-            ca = errorlog_mock.call_args_list[0][0][1]
-            self.assertTrue("test-3" in ca, "non matching {0}".format(ca))
-            self.assertTrue("test.3" in ca, "non matching {0}".format(ca))
-
     @patch.object(MockCursor, 'execute', Mock(side_effect=psycopg2.OperationalError))
     def test__query(self):
         self.assertRaises(PostgresConnectionException, self.p._query, 'blabla')
@@ -339,7 +316,7 @@ class TestPostgresql(BaseTestPostgresql):
     @patch.object(Postgresql, 'pg_isready', Mock(return_value=STATE_REJECT))
     def test_is_leader(self):
         self.assertTrue(self.p.is_leader())
-        self.p.reset_cluster_info_state()
+        self.p.reset_cluster_info_state(None)
         with patch.object(Postgresql, '_query', Mock(side_effect=RetryFailedError(''))):
             self.assertRaises(PostgresConnectionException, self.p.is_leader)
 
@@ -498,7 +475,8 @@ class TestPostgresql(BaseTestPostgresql):
         parameters = self._PARAMETERS.copy()
         parameters.pop('f.oo')
         parameters['wal_buffers'] = '512'
-        config = {'pg_hba': [''], 'pg_ident': [''], 'use_unix_socket': True, 'authentication': {},
+        config = {'pg_hba': [''], 'pg_ident': [''], 'use_unix_socket': True, 'use_unix_socket_repl': True,
+                  'authentication': {},
                   'retry_timeout': 10, 'listen': '*', 'krbsrvname': 'postgres', 'parameters': parameters}
         self.p.reload_config(config)
         mock_fetchone.side_effect = Exception
@@ -522,8 +500,9 @@ class TestPostgresql(BaseTestPostgresql):
             self.assertEqual(self.p.get_major_version(), 0)
 
     def test_postmaster_start_time(self):
-        with patch.object(MockCursor, "fetchone", Mock(return_value=('foo', True, '', '', '', '', False))):
-            self.assertEqual(self.p.postmaster_start_time(), 'foo')
+        now = datetime.datetime.now()
+        with patch.object(MockCursor, "fetchone", Mock(return_value=(now, True, '', '', '', '', False))):
+            self.assertEqual(self.p.postmaster_start_time(), now.isoformat(sep=' '))
             t = Thread(target=self.p.postmaster_start_time)
             t.start()
             t.join()
@@ -609,7 +588,7 @@ class TestPostgresql(BaseTestPostgresql):
 
     def test_pick_sync_standby(self):
         cluster = Cluster(True, None, self.leader, 0, [self.me, self.other, self.leadermem], None,
-                          SyncState(0, self.me.name, self.leadermem.name), None)
+                          SyncState(0, self.me.name, self.leadermem.name), None, None)
         mock_cursor = Mock()
         mock_cursor.fetchone.return_value = ('remote_apply',)
 
@@ -707,6 +686,8 @@ class TestPostgresql(BaseTestPostgresql):
         self.assertEqual(self.p.get_master_timeline(), 1)
 
     @patch.object(Postgresql, 'get_postgres_role_from_data_directory', Mock(return_value='replica'))
+    @patch.object(Bootstrap, 'running_custom_bootstrap', PropertyMock(return_value=True))
+    @patch.object(Bootstrap, 'keep_existing_recovery_conf', PropertyMock(return_value=True))
     def test__build_effective_configuration(self):
         with patch.object(Postgresql, 'controldata',
                           Mock(return_value={'max_connections setting': '200',
@@ -725,10 +706,14 @@ class TestPostgresql(BaseTestPostgresql):
     @patch.object(Postgresql, '_query', Mock(side_effect=RetryFailedError('')))
     def test_received_timeline(self):
         self.p.set_role('standby_leader')
-        self.p.reset_cluster_info_state()
+        self.p.reset_cluster_info_state(None)
         self.assertRaises(PostgresConnectionException, self.p.received_timeline)
 
     def test__write_recovery_params(self):
         self.p.config._write_recovery_params(Mock(), {'pause_at_recovery_target': 'false'})
         with patch.object(Postgresql, 'major_version', PropertyMock(return_value=90400)):
             self.p.config._write_recovery_params(Mock(), {'recovery_target_action': 'PROMOTE'})
+
+    @patch.object(Postgresql, 'is_running', Mock(return_value=True))
+    def test_set_enforce_hot_standby_feedback(self):
+        self.p.set_enforce_hot_standby_feedback(True)

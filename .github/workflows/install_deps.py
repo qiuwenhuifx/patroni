@@ -22,7 +22,7 @@ def install_requirements(what):
     for r in read('requirements.txt').split('\n'):
         r = r.strip()
         if r != '':
-            extras = {e for e, v in EXTRAS_REQUIRE.items() if v and r.startswith(v[0])}
+            extras = {e for e, v in EXTRAS_REQUIRE.items() if v and any(r.startswith(x) for x in v)}
             if not extras or what == 'all' or what in extras:
                 requirements.append(r)
 
@@ -39,7 +39,8 @@ def install_packages(what):
     }
     packages['exhibitor'] = packages['zookeeper']
     packages = packages.get(what, [])
-    ver = str({'etcd': '9.6', 'etcd3': '9.6', 'consul': 10, 'exhibitor': 11, 'kubernetes': 12, 'raft': 13}.get(what))
+    ver = str({'etcd': '9.6', 'etcd3': '13', 'consul': 12, 'exhibitor': 11, 'kubernetes': 13, 'raft': 12}.get(what))
+    subprocess.call(['sudo', 'apt-get', 'update', '-y'])
     return subprocess.call(['sudo', 'apt-get', 'install', '-y', 'postgresql-' + ver, 'expect-dev', 'wget'] + packages)
 
 

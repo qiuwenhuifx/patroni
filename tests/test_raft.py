@@ -1,14 +1,15 @@
 import os
 import unittest
+import tempfile
 import time
 
-from mock import Mock, patch
+from mock import Mock, PropertyMock, patch
 from patroni.dcs.raft import DynMemberSyncObj, KVStoreTTL, Raft, SyncObjUtility
 from pysyncobj import SyncObjConf, FAIL_REASON
 
 
 def remove_files(prefix):
-    for f in ('journal', 'dump'):
+    for f in ('journal', 'journal.meta', 'dump'):
         f = prefix + f
         if os.path.isfile(f):
             for i in range(0, 15):
@@ -30,50 +31,38 @@ class TestDynMemberSyncObj(unittest.TestCase):
         self.conf = SyncObjConf(appendEntriesUseBatch=False, dynamicMembershipChange=True, autoTick=False)
         self.so = DynMemberSyncObj('127.0.0.1:1234', ['127.0.0.1:1235'], self.conf)
 
-    @patch.object(SyncObjUtility, 'sendMessage')
-    def test_add_member(self, mock_send_message):
-        mock_send_message.return_value = [{'addr': '127.0.0.1:1235'}, {'addr': '127.0.0.1:1236'}]
-        mock_send_message.ver = 0
+    @patch.object(SyncObjUtility, 'executeCommand')
+    def test_add_member(self, mock_execute_command):
+        mock_execute_command.return_value = [{'addr': '127.0.0.1:1235'}, {'addr': '127.0.0.1:1236'}]
+        mock_execute_command.ver = 0
         DynMemberSyncObj('127.0.0.1:1234', ['127.0.0.1:1235'], self.conf)
         self.conf.dynamicMembershipChange = False
         DynMemberSyncObj('127.0.0.1:1234', ['127.0.0.1:1235'], self.conf)
 
-    def test___onUtilityMessage(self):
-        self.so._SyncObj__encryptor = Mock()
+    def test_getMembers(self):
         mock_conn = Mock()
-        mock_conn.sendRandKey = None
-        self.so._SyncObj__transport._onIncomingMessageReceived(mock_conn, 'randkey')
         self.so._SyncObj__transport._onIncomingMessageReceived(mock_conn, ['members'])
-        self.so._SyncObj__transport._onIncomingMessageReceived(mock_conn, ['status'])
 
     def test__SyncObj__doChangeCluster(self):
         self.so._SyncObj__doChangeCluster(['add', '127.0.0.1:1236'])
 
-    def test_utility(self):
-        utility = SyncObjUtility(['127.0.0.1:1235'], self.conf)
-        utility.setPartnerNode(list(utility._SyncObj__otherNodes)[0])
-        utility.sendMessage(['members'])
-        utility._onMessageReceived(0, '')
 
-
+@patch.object(SyncObjConf, 'fullDumpFile', PropertyMock(return_value=None), create=True)
+@patch.object(SyncObjConf, 'journalFile', PropertyMock(return_value=None), create=True)
 class TestKVStoreTTL(unittest.TestCase):
 
+    @patch.object(SyncObjConf, 'fullDumpFile', PropertyMock(return_value=None), create=True)
+    @patch.object(SyncObjConf, 'journalFile', PropertyMock(return_value=None), create=True)
     def setUp(self):
-        self.conf = SyncObjConf(appendEntriesUseBatch=False, appendEntriesPeriod=0.001,
-                                raftMinTimeout=0.004, raftMaxTimeout=0.005, autoTickPeriod=0.001)
         callback = Mock()
         callback.replicated = False
-        self.so = KVStoreTTL('127.0.0.1:1234', [], self.conf, on_set=callback, on_delete=callback)
+        self.so = KVStoreTTL(None, callback, callback, self_addr='127.0.0.1:1234')
+        self.so.startAutoTick()
         self.so.set_retry_timeout(10)
-
-    @staticmethod
-    def destroy(so):
-        so.destroy()
-        so._SyncObj__thread.join()
 
     def tearDown(self):
         if self.so:
-            self.destroy(self.so)
+            self.so.destroy()
 
     def test_set(self):
         self.assertTrue(self.so.set('foo', 'bar', prevExist=False, ttl=30))
@@ -82,7 +71,7 @@ class TestKVStoreTTL(unittest.TestCase):
         self.assertTrue(self.so.retry(self.so._set, 'foo', {'value': 'buz', 'created': 1, 'updated': 1}))
 
     def test_delete(self):
-        self.conf.autoTickPeriod = 0.1
+        self.so.autoTickPeriod = 0.2
         self.so.set('foo', 'bar')
         self.so.set('fooo', 'bar')
         self.assertFalse(self.so.delete('foo', prevValue='buz'))
@@ -110,28 +99,35 @@ class TestKVStoreTTL(unittest.TestCase):
 
     def test_on_ready_override(self):
         self.assertTrue(self.so.set('foo', 'bar'))
-        self.destroy(self.so)
+        self.so.destroy()
         self.so = None
-        self.conf.onReady = Mock()
-        self.conf.autoTick = False
-        so = KVStoreTTL('127.0.0.1:1234', ['127.0.0.1:1235'], self.conf)
+        so = KVStoreTTL(Mock(), None, None, self_addr='127.0.0.1:1234',
+                        partner_addrs=['127.0.0.1:1235'], patronictl=True)
         so.doTick(0)
         so.destroy()
 
 
 class TestRaft(unittest.TestCase):
 
+    _TMP = tempfile.gettempdir()
+
     def test_raft(self):
-        raft = Raft({'ttl': 30, 'scope': 'test', 'name': 'pg', 'self_addr': '127.0.0.1:1234', 'retry_timeout': 10})
+        raft = Raft({'ttl': 30, 'scope': 'test', 'name': 'pg', 'self_addr': '127.0.0.1:1234',
+                     'retry_timeout': 10, 'data_dir': self._TMP})
         raft.set_retry_timeout(20)
         raft.set_ttl(60)
+        self.assertTrue(raft._sync_obj.set(raft.members_path + 'legacy', '{"version":"2.0.0"}'))
         self.assertTrue(raft.touch_member(''))
         self.assertTrue(raft.initialize())
         self.assertTrue(raft.cancel_initialization())
         self.assertTrue(raft.set_config_value('{}'))
         self.assertTrue(raft.write_sync_state('foo', 'bar'))
-        self.assertTrue(raft.update_leader('1'))
         self.assertTrue(raft.manual_failover('foo', 'bar'))
+        raft.get_cluster()
+        self.assertTrue(raft._sync_obj.set(raft.status_path, '{"optime":1234567,"slots":{"ls":12345}}'))
+        raft.get_cluster()
+        self.assertTrue(raft.update_leader('1'))
+        self.assertTrue(raft._sync_obj.set(raft.status_path, '{'))
         raft.get_cluster()
         self.assertTrue(raft.delete_sync_state())
         self.assertTrue(raft.delete_leader())
@@ -141,10 +137,9 @@ class TestRaft(unittest.TestCase):
         self.assertTrue(raft.take_leader())
         raft.watch(None, 0.001)
         raft._sync_obj.destroy()
-        raft._sync_obj._SyncObj__thread.join()
 
     def tearDown(self):
-        remove_files('127.0.0.1:1234.')
+        remove_files(os.path.join(self._TMP, '127.0.0.1:1234.'))
 
     def setUp(self):
         self.tearDown()
@@ -154,4 +149,5 @@ class TestRaft(unittest.TestCase):
     def test_init(self, mock_event, mock_kvstore):
         mock_kvstore.return_value.applied_local_log = False
         mock_event.return_value.isSet.side_effect = [False, True]
-        self.assertIsNotNone(Raft({'ttl': 30, 'scope': 'test', 'name': 'pg', 'patronictl': True, 'self_addr': '1'}))
+        self.assertIsNotNone(Raft({'ttl': 30, 'scope': 'test', 'name': 'pg', 'patronictl': True,
+                                   'self_addr': '1', 'data_dir': self._TMP}))
