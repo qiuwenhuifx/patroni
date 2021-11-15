@@ -282,11 +282,16 @@ class RestApiHandler(BaseHTTPRequestHandler):
 
         metrics.append("# HELP patroni_cluster_unlocked Value is 1 if the cluster is unlocked, 0 if locked.")
         metrics.append("# TYPE patroni_cluster_unlocked gauge")
-        metrics.append("patroni_cluster_unlocked{0} {1}".format(scope_label, int(postgres['cluster_unlocked'])))
+        metrics.append("patroni_cluster_unlocked{0} {1}".format(scope_label, int(postgres.get('cluster_unlocked', 0))))
 
         metrics.append("# HELP patroni_postgres_timeline Postgres timeline of this node (if running), 0 otherwise.")
         metrics.append("# TYPE patroni_postgres_timeline counter")
         metrics.append("patroni_postgres_timeline{0} {1}".format(scope_label, postgres.get('timeline', 0)))
+
+        metrics.append("# HELP patroni_dcs_last_seen Epoch timestamp when DCS was last contacted successfully"
+                       " by Patroni.")
+        metrics.append("# TYPE patroni_dcs_last_seen gauge")
+        metrics.append("patroni_dcs_last_seen{0} {1}".format(scope_label, postgres.get('dcs_last_seen', 0)))
 
         self._write_response(200, '\n'.join(metrics)+'\n', content_type='text/plain')
 
@@ -599,7 +604,6 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 'postmaster_start_time': row[0],
                 'role': 'replica' if row[1] == 0 else 'master',
                 'server_version': postgresql.server_version,
-                'cluster_unlocked': bool(not cluster or cluster.is_unlocked()),
                 'xlog': ({
                     'received_location': row[4] or row[3],
                     'replayed_location': row[3],
@@ -621,13 +625,17 @@ class RestApiHandler(BaseHTTPRequestHandler):
             if row[7]:
                 result['replication'] = row[7]
 
-            return result
         except (psycopg2.Error, RetryFailedError, PostgresConnectionException):
             state = postgresql.state
             if state == 'running':
                 logger.exception('get_postgresql_status')
                 state = 'unknown'
-            return {'state': state, 'role': postgresql.role}
+            result = {'state': state, 'role': postgresql.role}
+
+        if not cluster or cluster.is_unlocked():
+            result['cluster_unlocked'] = True
+        result['dcs_last_seen'] = self.server.patroni.dcs.last_seen
+        return result
 
     def handle_one_request(self):
         self.__start_time = time.time()
@@ -867,6 +875,6 @@ class RestApiServer(ThreadingMixIn, HTTPServer, Thread):
 
     @staticmethod
     def handle_error(request, client_address):
-        address, port = client_address
-        logger.warning('Exception happened during processing of request from {}:{}'.format(address, port))
+        logger.warning('Exception happened during processing of request from %s:%s',
+                       client_address[0], client_address[1])
         logger.warning(traceback.format_exc())

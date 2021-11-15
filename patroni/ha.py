@@ -3,6 +3,7 @@ import functools
 import json
 import logging
 import psycopg2
+import six
 import sys
 import time
 import uuid
@@ -21,13 +22,15 @@ from threading import RLock
 logger = logging.getLogger(__name__)
 
 
-class _MemberStatus(namedtuple('_MemberStatus', ['member', 'reachable', 'in_recovery', 'timeline',
-                                                 'wal_position', 'tags', 'watchdog_failed'])):
+class _MemberStatus(namedtuple('_MemberStatus', ['member', 'reachable', 'in_recovery',
+                                                 'dcs_last_seen', 'timeline', 'wal_position',
+                                                 'tags', 'watchdog_failed'])):
     """Node status distilled from API response:
 
         member - dcs.Member object of the node
         reachable - `!False` if the node is not reachable or is not responding with correct JSON
         in_recovery - `!True` if pg_is_in_recovery() == true
+        dcs_last_seen - timestamp from JSON of last succesful communication with DCS
         timeline - timeline value from JSON
         wal_position - maximum value of `replayed_location` or `received_location` from JSON
         tags - dictionary with values of different tags (i.e. nofailover)
@@ -37,12 +40,14 @@ class _MemberStatus(namedtuple('_MemberStatus', ['member', 'reachable', 'in_reco
     def from_api_response(cls, member, json):
         is_master = json['role'] == 'master'
         timeline = json.get('timeline', 0)
+        dcs_last_seen = json.get('dcs_last_seen', 0)
         wal = not is_master and max(json['xlog'].get('received_location', 0), json['xlog'].get('replayed_location', 0))
-        return cls(member, True, not is_master, timeline, wal, json.get('tags', {}), json.get('watchdog_failed', False))
+        return cls(member, True, not is_master, dcs_last_seen, timeline, wal,
+                   json.get('tags', {}), json.get('watchdog_failed', False))
 
     @classmethod
     def unknown(cls, member):
-        return cls(member, False, None, 0, 0, {}, False)
+        return cls(member, False, None, 0, 0, 0, {}, False)
 
     def failover_limitation(self):
         """Returns reason why this node can't promote or None if everything is ok."""
@@ -313,10 +318,7 @@ class Ha(object):
             if timeout == 0:
                 # We are requested to prefer failing over to restarting master. But see first if there
                 # is anyone to fail over to.
-                members = self.cluster.members
-                if self.is_synchronous_mode():
-                    members = [m for m in members if self.cluster.sync.matches(m.name)]
-                if self.is_failover_possible(members):
+                if self.is_failover_possible(self.cluster.members):
                     logger.info("Master crashed. Failing over.")
                     self.demote('immediate')
                     return 'stopped PostgreSQL to fail over after a crash'
@@ -551,7 +553,7 @@ class Ha(object):
         if master_timeline == 1:
             if cluster_history:
                 self.dcs.set_history_value('[]')
-        elif not cluster_history or cluster_history[-1][0] != master_timeline - 1 or len(cluster_history[-1]) != 4:
+        elif not cluster_history or cluster_history[-1][0] != master_timeline - 1 or len(cluster_history[-1]) != 5:
             cluster_history = {line[0]: line for line in cluster_history or []}
             history = self.state_handler.get_history(master_timeline)
             if history and self.cluster.config:
@@ -559,9 +561,11 @@ class Ha(object):
                 for line in history:
                     # enrich current history with promotion timestamps stored in DCS
                     if len(line) == 3 and line[0] in cluster_history \
-                            and len(cluster_history[line[0]]) == 4 \
+                            and len(cluster_history[line[0]]) >= 4 \
                             and cluster_history[line[0]][1] == line[1]:
                         line.append(cluster_history[line[0]][3])
+                        if len(cluster_history[line[0]]) == 5:
+                            line.append(cluster_history[line[0]][4])
                 self.dcs.set_history_value(json.dumps(history, separators=(',', ':')))
 
     def enforce_follow_remote_master(self, message):
@@ -684,16 +688,21 @@ class Ha(object):
                         logger.info('Ignoring the former leader being ahead of us')
         return True
 
-    def is_failover_possible(self, members):
+    def is_failover_possible(self, members, check_synchronous=True, cluster_lsn=None):
         ret = False
         cluster_timeline = self.cluster.timeline
         members = [m for m in members if m.name != self.state_handler.name and not m.nofailover and m.api_url]
+        if check_synchronous and self.is_synchronous_mode():
+            members = [m for m in members if self.cluster.sync.matches(m.name)]
         if members:
             for st in self.fetch_nodes_statuses(members):
                 not_allowed_reason = st.failover_limitation()
                 if not_allowed_reason:
                     logger.info('Member %s is %s', st.member.name, not_allowed_reason)
-                elif self.is_lagging(st.wal_position):
+                elif not isinstance(st.wal_position, six.integer_types):
+                    logger.info('Member %s does not report wal_position', st.member.name)
+                elif cluster_lsn and st.wal_position < cluster_lsn or\
+                        not cluster_lsn and self.is_lagging(st.wal_position):
                     logger.info('Member %s exceeds maximum replication lag', st.member.name)
                 elif self.check_timeline() and (not st.timeline or st.timeline < cluster_timeline):
                     logger.info('Timeline %s of member %s is behind the cluster timeline %s',
@@ -777,6 +786,10 @@ class Ha(object):
             return False
 
         if self.cluster.failover:
+            # When doing a switchover in synchronous mode only synchronous nodes and former leader are allowed to race
+            if self.is_synchronous_mode() and self.cluster.failover.leader and \
+                    self.cluster.failover.candidate and not self.cluster.sync.matches(self.state_handler.name):
+                return False
             return self.manual_failover_process_no_leader()
 
         if not self.watchdog.is_healthy:
@@ -824,23 +837,44 @@ class Ha(object):
             'immediate-nolock': dict(stop='immediate', checkpoint=False, release=False, offline=False, async_req=True),
         }[mode]
 
+        logger.info('Demoting self (%s)', mode)
+
         self._rewind.trigger_check_diverged_lsn()
+
+        status = {'released': False}
+
+        def on_shutdown(checkpoint_location):
+            # Postmaster is still running, but pg_control already reports clean "shut down".
+            # It could happen if Postgres is still archiving the backlog of WAL files.
+            # If we know that there are replicas that received the shutdown checkpoint
+            # location, we can remove the leader key and allow them to start leader race.
+            if self.is_failover_possible(self.cluster.members, cluster_lsn=checkpoint_location):
+                self.state_handler.set_role('demoted')
+                with self._async_executor:
+                    self.release_leader_key_voluntarily(checkpoint_location)
+                    status['released'] = True
+
         self.state_handler.stop(mode_control['stop'], checkpoint=mode_control['checkpoint'],
                                 on_safepoint=self.watchdog.disable if self.watchdog.is_running else None,
+                                on_shutdown=on_shutdown if mode_control['release'] else None,
                                 stop_timeout=self.master_stop_timeout())
         self.state_handler.set_role('demoted')
         self.set_is_leader(False)
 
         if mode_control['release']:
-            checkpoint_location = self.state_handler.latest_checkpoint_location() if mode == 'graceful' else None
-            with self._async_executor:
-                self.release_leader_key_voluntarily(checkpoint_location)
+            if not status['released']:
+                checkpoint_location = self.state_handler.latest_checkpoint_location() if mode == 'graceful' else None
+                with self._async_executor:
+                    self.release_leader_key_voluntarily(checkpoint_location)
             time.sleep(2)  # Give a time to somebody to take the leader lock
         if mode_control['offline']:
             node_to_follow, leader = None, None
         else:
-            cluster = self.dcs.get_cluster()
-            node_to_follow, leader = self._get_node_to_follow(cluster), cluster.leader
+            try:
+                cluster = self.dcs.get_cluster()
+                node_to_follow, leader = self._get_node_to_follow(cluster), cluster.leader
+            except Exception:
+                node_to_follow, leader = None, None
 
         # FIXME: with mode offline called from DCS exception handler and handle_long_action_in_progress
         # there could be an async action already running, calling follow from here will lead
@@ -918,7 +952,7 @@ class Ha(object):
                     else:
                         members = [m for m in self.cluster.members
                                    if not failover.candidate or m.name == failover.candidate]
-                    if self.is_failover_possible(members):  # check that there are healthy members
+                    if self.is_failover_possible(members, False):  # check that there are healthy members
                         ret = self._async_executor.try_run_async('manual failover: demote', self.demote, ('graceful',))
                         return ret or 'manual failover: demoting myself'
                     else:
@@ -995,13 +1029,13 @@ class Ha(object):
                     # in case of standby cluster we don't really need to
                     # enforce anything, since the leader is not a master.
                     # So just remind the role.
-                    msg = 'no action. I am ({0}) the standby leader with the lock'.format(self.state_handler.name) \
+                    msg = 'no action. I am ({0}), the standby leader with the lock'.format(self.state_handler.name) \
                           if self.state_handler.role == 'standby_leader' else \
                           'promoted self to a standby leader because i had the session lock'
                     return self.enforce_follow_remote_master(msg)
                 else:
                     return self.enforce_master_role(
-                        'no action. I am ({0}) the leader with the lock'.format(self.state_handler.name),
+                        'no action. I am ({0}), the leader with the lock'.format(self.state_handler.name),
                         'promoted self to leader because I had the session lock'
                     )
             else:
@@ -1019,10 +1053,10 @@ class Ha(object):
         lock_owner = self.cluster.leader and self.cluster.leader.name
         if self.is_standby_cluster():
             return self.follow('cannot be a real primary in a standby cluster',
-                               'no action. I am a secondary ({0}) and following a standby leader ({1})'.format(
+                               'no action. I am ({0}), a secondary, and following a standby leader ({1})'.format(
                                     self.state_handler.name, lock_owner), refresh=False)
         return self.follow('demoting self because I do not have the lock and I was a leader',
-                           'no action. I am a secondary ({0}) and following a leader ({1})'.format(
+                           'no action. I am ({0}), a secondary, and following a leader ({1})'.format(
                                 self.state_handler.name, lock_owner), refresh=False)
 
     def evaluate_scheduled_restart(self):
@@ -1484,10 +1518,27 @@ class Ha(object):
             # This might not be the desired behavior of users, as a graceful shutdown of the host can mean lost data.
             # We probably need to something smarter here.
             disable_wd = self.watchdog.disable if self.watchdog.is_running else None
+
+            status = {'deleted': False}
+
+            def _on_shutdown(checkpoint_location):
+                if self.is_leader():
+                    # Postmaster is still running, but pg_control already reports clean "shut down".
+                    # It could happen if Postgres is still archiving the backlog of WAL files.
+                    # If we know that there are replicas that received the shutdown checkpoint
+                    # location, we can remove the leader key and allow them to start leader race.
+                    if self.is_failover_possible(self.cluster.members, cluster_lsn=checkpoint_location):
+                        self.dcs.delete_leader(checkpoint_location)
+                        status['deleted'] = True
+                    else:
+                        self.dcs.write_leader_optime(checkpoint_location)
+
+            on_shutdown = _on_shutdown if self.is_leader() else None
             self.while_not_sync_standby(lambda: self.state_handler.stop(checkpoint=False, on_safepoint=disable_wd,
+                                                                        on_shutdown=on_shutdown,
                                                                         stop_timeout=self.master_stop_timeout()))
             if not self.state_handler.is_running():
-                if self.is_leader():
+                if self.is_leader() and not status['deleted']:
                     checkpoint_location = self.state_handler.latest_checkpoint_location()
                     self.dcs.delete_leader(checkpoint_location)
                 self.touch_member()

@@ -485,7 +485,7 @@ class ConfigHandler(object):
         # A list of keywords that can be found in a conninfo string. Follows what is acceptable by libpq
         keywords = ('dbname', 'user', 'passfile' if params.get('passfile') else 'password', 'host', 'port',
                     'sslmode', 'sslcompression', 'sslcert', 'sslkey', 'sslpassword', 'sslrootcert', 'sslcrl',
-                    'application_name', 'krbsrvname', 'gssencmode', 'channel_binding')
+                    'sslcrldir', 'application_name', 'krbsrvname', 'gssencmode', 'channel_binding')
         if include_dbname:
             params = params.copy()
             params['dbname'] = params.get('database') or self._postgresql.database
@@ -834,7 +834,7 @@ class ConfigHandler(object):
         # this exercise is improving cross version compatibility and user must set the correct parameter in the config.
         if self._postgresql.major_version >= 130000:
             wal_keep_segments = parameters.pop('wal_keep_segments', self.CMDLINE_OPTIONS['wal_keep_segments'][0])
-            parameters.setdefault('wal_keep_size', str(wal_keep_segments * 16) + 'MB')
+            parameters.setdefault('wal_keep_size', str(int(wal_keep_segments) * 16) + 'MB')
         elif self._postgresql.major_version:
             wal_keep_size = parse_int(parameters.pop('wal_keep_size', self.CMDLINE_OPTIONS['wal_keep_size'][0]), 'MB')
             parameters.setdefault('wal_keep_segments', int((wal_keep_size + 8) / 16))
@@ -1001,8 +1001,9 @@ class ConfigHandler(object):
             if self._postgresql.major_version >= 90500:
                 time.sleep(1)
                 try:
-                    pending_restart = self._postgresql.query('SELECT COUNT(*) FROM pg_catalog.pg_settings'
-                                                             ' WHERE pending_restart').fetchone()[0] > 0
+                    pending_restart = self._postgresql.query(
+                        'SELECT COUNT(*) FROM pg_catalog.pg_settings WHERE pg_catalog.lower(name) != ALL(%s)'
+                        ' AND pending_restart', [n.lower() for n in self._RECOVERY_PARAMETERS]).fetchone()[0] > 0
                     self._postgresql.set_pending_restart(pending_restart)
                 except Exception as e:
                     logger.warning('Exception %r when running query', e)

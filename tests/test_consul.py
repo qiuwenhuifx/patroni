@@ -130,8 +130,9 @@ class TestConsul(unittest.TestCase):
     @patch.object(consul.Consul.KV, 'put', Mock(side_effect=[True, ConsulException, InvalidSession]))
     def test_touch_member(self):
         self.c.refresh_session = Mock(return_value=False)
-        self.c.touch_member({'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5433/postgres',
-                             'api_url': 'http://127.0.0.1:8009/patroni'})
+        with patch.object(Consul, 'update_service', Mock(side_effect=Exception)):
+            self.c.touch_member({'conn_url': 'postgres://replicator:rep-pass@127.0.0.1:5433/postgres',
+                                 'api_url': 'http://127.0.0.1:8009/patroni'})
         self.c._register_service = True
         self.c.refresh_session = Mock(return_value=True)
         for _ in range(0, 4):
@@ -215,4 +216,50 @@ class TestConsul(unittest.TestCase):
         self.assertIsNone(self.c.update_service({}, d))
 
     def test_reload_config(self):
-        self.c.reload_config({'consul': {'token': 'foo'}, 'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        self.assertEqual([], self.c._service_tags)
+        self.c.reload_config({'consul': {'token': 'foo', 'register_service': True, 'service_tags': ['foo']},
+                              'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        self.assertEqual(["foo"], self.c._service_tags)
+
+        self.c.refresh_session = Mock(return_value=False)
+
+        d = {'role': 'replica', 'api_url': 'http://a/t', 'conn_url': 'pg://c:1', 'state': 'running'}
+
+        # Changing register_service from True to False calls deregister()
+        self.c.reload_config({'consul': {'register_service': False}, 'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        with patch('consul.Consul.Agent.Service.deregister') as mock_deregister:
+            self.c.touch_member(d)
+            mock_deregister.assert_called_once()
+
+        self.assertEqual([], self.c._service_tags)
+
+        # register_service staying False between reloads does not call deregister()
+        self.c.reload_config({'consul': {'register_service': False}, 'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        with patch('consul.Consul.Agent.Service.deregister') as mock_deregister:
+            self.c.touch_member(d)
+            self.assertFalse(mock_deregister.called)
+
+        # Changing register_service from False to True calls register()
+        self.c.reload_config({'consul': {'register_service': True}, 'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        with patch('consul.Consul.Agent.Service.register') as mock_register:
+            self.c.touch_member(d)
+            mock_register.assert_called_once()
+
+        # register_service staying True between reloads does not call register()
+        self.c.reload_config({'consul': {'register_service': True}, 'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        with patch('consul.Consul.Agent.Service.register') as mock_register:
+            self.c.touch_member(d)
+            self.assertFalse(mock_deregister.called)
+
+        # register_service staying True between reloads does calls register() if other service data has changed
+        self.c.reload_config({'consul': {'register_service': True}, 'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10})
+        with patch('consul.Consul.Agent.Service.register') as mock_register:
+            self.c.touch_member(d)
+            mock_register.assert_called_once()
+
+        # register_service staying True between reloads does calls register() if service_tags have changed
+        self.c.reload_config({'consul': {'register_service': True, 'service_tags': ['foo']}, 'loop_wait': 10,
+                              'ttl': 30, 'retry_timeout': 10})
+        with patch('consul.Consul.Agent.Service.register') as mock_register:
+            self.c.touch_member(d)
+            mock_register.assert_called_once()

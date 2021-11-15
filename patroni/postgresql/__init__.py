@@ -369,7 +369,11 @@ class Postgresql(object):
         return self._cluster_info_state_get('received_tli')
 
     def is_leader(self):
-        return bool(self._cluster_info_state_get('timeline'))
+        try:
+            return bool(self._cluster_info_state_get('timeline'))
+        except PostgresConnectionException:
+            logger.warning('Failed to determine PostgreSQL state from the connection, falling back to cached role')
+            return bool(self.is_running() and self.role == 'master')
 
     def replay_paused(self):
         return self._cluster_info_state_get('replay_paused')
@@ -598,7 +602,8 @@ class Postgresql(object):
             logger.exception('Exception during CHECKPOINT')
             return 'not accessible or not healty'
 
-    def stop(self, mode='fast', block_callbacks=False, checkpoint=None, on_safepoint=None, stop_timeout=None):
+    def stop(self, mode='fast', block_callbacks=False, checkpoint=None,
+             on_safepoint=None, on_shutdown=None, stop_timeout=None):
         """Stop PostgreSQL
 
         Supports a callback when a safepoint is reached. A safepoint is when no user backend can return a successful
@@ -606,11 +611,12 @@ class Postgresql(object):
         could be added.
 
         :param on_safepoint: This callback is called when no user backends are running.
+        :param on_shutdown: is called when pg_controldata starts reporting `Database cluster state: shut down`
         """
         if checkpoint is None:
             checkpoint = False if mode == 'immediate' else True
 
-        success, pg_signaled = self._do_stop(mode, block_callbacks, checkpoint, on_safepoint, stop_timeout)
+        success, pg_signaled = self._do_stop(mode, block_callbacks, checkpoint, on_safepoint, on_shutdown, stop_timeout)
         if success:
             # block_callbacks is used during restart to avoid
             # running start/stop callbacks in addition to restart ones
@@ -623,7 +629,7 @@ class Postgresql(object):
             self.set_state('stop failed')
         return success
 
-    def _do_stop(self, mode, block_callbacks, checkpoint, on_safepoint, stop_timeout):
+    def _do_stop(self, mode, block_callbacks, checkpoint, on_safepoint, on_shutdown, stop_timeout):
         postmaster = self.is_running()
         if not postmaster:
             if on_safepoint:
@@ -649,6 +655,22 @@ class Postgresql(object):
             self._wait_for_connection_close(postmaster)
             postmaster.wait_for_user_backends_to_close()
             on_safepoint()
+
+        if on_shutdown and mode in ('fast', 'smart'):
+            i = 0
+            # Wait for pg_controldata `Database cluster state:` to change to "shut down"
+            while postmaster.is_running():
+                data = self.controldata()
+                if data.get('Database cluster state', '') == 'shut down':
+                    on_shutdown(int(self.latest_checkpoint_location()))
+                    break
+                elif data.get('Database cluster state', '').startswith('shut down'):  # shut down in recovery
+                    break
+                elif stop_timeout and i >= stop_timeout:
+                    stop_timeout = 0
+                    break
+                time.sleep(STOP_POLLING_INTERVAL)
+                i += STOP_POLLING_INTERVAL
 
         try:
             postmaster.wait(timeout=stop_timeout)
@@ -809,7 +831,7 @@ class Postgresql(object):
             return None, None
 
     @contextmanager
-    def get_replication_connection_cursor(self, host='localhost', port=5432, **kwargs):
+    def get_replication_connection_cursor(self, host=None, port=5432, **kwargs):
         conn_kwargs = self.config.replication.copy()
         conn_kwargs.update(host=host, port=int(port) if port else None, user=conn_kwargs.pop('username'),
                            connect_timeout=3, replication=1, options='-c statement_timeout=2000')
@@ -843,6 +865,7 @@ class Postgresql(object):
                 if history[-1][0] == timeline - 1:
                     history_mtime = datetime.fromtimestamp(history_mtime).replace(tzinfo=tz.tzlocal())
                     history[-1].append(history_mtime.isoformat())
+                    history[-1].append(self.name)
                 return history
             except Exception:
                 logger.exception('Failed to read and parse %s', (history_path,))
@@ -860,20 +883,22 @@ class Postgresql(object):
         if change_role:
             self.__cb_pending = ACTION_NOOP
 
+        ret = True
         if self.is_running():
             if do_reload:
                 self.config.write_postgresql_conf()
-                if self.reload(block_callbacks=change_role) and change_role:
+                ret = self.reload(block_callbacks=change_role)
+                if ret and change_role:
                     self.set_role(role)
             else:
-                self.restart(block_callbacks=change_role, role=role)
+                ret = self.restart(block_callbacks=change_role, role=role)
         else:
-            self.start(timeout=timeout, block_callbacks=change_role, role=role)
+            ret = self.start(timeout=timeout, block_callbacks=change_role, role=role) or None
 
         if change_role:
             # TODO: postpone this until start completes, or maybe do even earlier
             self.call_nowait(ACTION_ON_ROLE_CHANGE)
-        return True
+        return ret
 
     def _wait_promote(self, wait_seconds):
         for _ in polling_loop(wait_seconds):
@@ -1077,7 +1102,7 @@ class Postgresql(object):
         for app_name, sync_state, replica_lsn in self.query(
                 "SELECT pg_catalog.lower(application_name), sync_state, pg_{2}_{1}_diff({0}_{1}, '0/0')::bigint"
                 " FROM pg_catalog.pg_stat_replication"
-                " WHERE state = 'streaming'"
+                " WHERE state = 'streaming' AND {0}_{1} IS NOT NULL"
                 " ORDER BY sync_state DESC, {0}_{1} DESC".format(sort_col, self.lsn_name, self.wal_name)):
             member = members.get(app_name)
             if member and not member.tags.get('nosync', False):
