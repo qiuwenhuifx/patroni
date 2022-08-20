@@ -66,7 +66,7 @@ class TestRewind(BaseTestPostgresql):
 
     def test_pg_rewind(self):
         r = {'user': '', 'host': '', 'port': '', 'database': '', 'password': ''}
-        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=130000)),\
+        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=150000)),\
                 patch.object(CancellableSubprocess, 'call', Mock(return_value=None)):
             with patch('subprocess.check_output', Mock(return_value=b'boo')):
                 self.assertFalse(self.r.pg_rewind(r))
@@ -217,6 +217,62 @@ class TestRewind(BaseTestPostgresql):
     def test_cleanup_archive_status(self):
         self.r.cleanup_archive_status()
         self.r.cleanup_archive_status()
+
+    @patch('os.path.isfile', Mock(return_value=True))
+    @patch('shutil.move', Mock(side_effect=OSError))
+    @patch('patroni.postgresql.rewind.logger.info')
+    def test_archive_ready_wals(self, mock_logger_info):
+        with patch('os.listdir', Mock(side_effect=OSError)), \
+              patch.object(Postgresql, 'get_guc_value', Mock(side_effect=['on', 'command %f'])):
+            self.r._archive_ready_wals()
+            mock_logger_info.assert_not_called()
+
+        # each assert_not_called() calls get_guc_value('archive_mode') + get_guc_value('archive_command')
+        get_guc_value_res = [
+            '', 'command %f',
+            'on', '',
+        ]
+        with patch.object(Postgresql, 'get_guc_value', Mock(side_effect=get_guc_value_res)):
+            for _ in range(len(get_guc_value_res)//2):
+                self.r._archive_ready_wals()
+                mock_logger_info.assert_not_called()
+
+        with patch('os.listdir', Mock(return_value=['000000000000000000000000.ready'])):
+            # successful archive_command call
+            with patch.object(CancellableSubprocess, 'call',  Mock(return_value=0)):
+                get_guc_value_res = [
+                    'on', 'command %f',
+                    'always', 'command %f',
+                ]
+                with patch.object(Postgresql, 'get_guc_value', Mock(side_effect=get_guc_value_res)):
+                    for _ in range(len(get_guc_value_res)//2):
+                        self.r._archive_ready_wals()
+                        mock_logger_info.assert_called_once()
+                        self.assertEqual(('Trying to archive %s: %s',
+                                          '000000000000000000000000', 'command 000000000000000000000000'),
+                                         mock_logger_info.call_args[0])
+                        mock_logger_info.reset_mock()
+
+            # failed archive_command call
+            with patch.object(CancellableSubprocess, 'call', Mock(return_value=1)):
+                with patch.object(Postgresql, 'get_guc_value', Mock(side_effect=['on', 'command %f'])):
+                    self.r._archive_ready_wals()
+                    self.assertEqual(('Trying to archive %s: %s',
+                                      '000000000000000000000000', 'command 000000000000000000000000'),
+                                     mock_logger_info.call_args_list[0][0])
+                    self.assertEqual(('Failed to archive WAL segment %s', '000000000000000000000000'),
+                                     mock_logger_info.call_args_list[1][0])
+                    mock_logger_info.reset_mock()
+
+        wal_files_to_skip = [
+            '000000000000000000000000.done',
+            '000000000000000000000001.partial.done',
+            '002.ready',
+            'U00000000000000000000001.ready',
+        ]
+        with patch('os.listdir', Mock(return_value=wal_files_to_skip)):
+            self.r._archive_ready_wals()
+            mock_logger_info.assert_not_called()
 
     @patch('os.unlink', Mock())
     @patch('os.listdir', Mock(return_value=[]))

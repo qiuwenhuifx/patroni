@@ -1,6 +1,8 @@
 import logging
 import os
+import re
 import shlex
+import shutil
 import six
 import subprocess
 
@@ -29,12 +31,16 @@ class Rewind(object):
         return data.get('wal_log_hints setting', 'off') == 'on' or data.get('Data page checksum version', '0') != '0'
 
     @property
+    def enabled(self):
+        return self._postgresql.config.get('use_pg_rewind')
+
+    @property
     def can_rewind(self):
         """ check if pg_rewind executable is there and that pg_controldata indicates
             we have either wal_log_hints or checksums turned on
         """
         # low-hanging fruit: check if pg_rewind configuration is there
-        if not self._postgresql.config.get('use_pg_rewind'):
+        if not self.enabled:
             return False
 
         cmd = [self._postgresql.pgcommand('pg_rewind'), '--help']
@@ -47,8 +53,12 @@ class Rewind(object):
         return self.configuration_allows_rewind(self._postgresql.controldata())
 
     @property
+    def should_remove_data_directory_on_diverged_timelines(self):
+        return self._postgresql.config.get('remove_data_directory_on_diverged_timelines')
+
+    @property
     def can_rewind_or_reinitialize_allowed(self):
-        return self._postgresql.config.get('remove_data_directory_on_diverged_timelines') or self.can_rewind
+        return self.should_remove_data_directory_on_diverged_timelines or self.can_rewind
 
     def trigger_check_diverged_lsn(self):
         if self.can_rewind_or_reinitialize_allowed and self._state != REWIND_STATUS.NEED:
@@ -182,8 +192,14 @@ class Rewind(object):
         if isinstance(leader, Leader) and leader.member.data.get('role') != 'master':
             return
 
-        if not self.check_leader_is_not_in_recovery(
-                self._conn_kwargs(leader, self._postgresql.config.replication)):
+        # We want to use replication credentials when connecting to the "postgres" database in case if
+        # `use_pg_rewind` isn't enabled and only `remove_data_directory_on_diverged_timelines` is set
+        # for Postgresql older than v11 (where Patroni can't use a dedicated user for rewind).
+        # In all other cases we will use rewind or superuser credentials.
+        check_credentials = self._postgresql.config.replication if not self.enabled and\
+            self.should_remove_data_directory_on_diverged_timelines and\
+            self._postgresql.major_version < 110000 else self._postgresql.config.rewind_credentials
+        if not self.check_leader_is_not_in_recovery(self._conn_kwargs(leader, check_credentials)):
             return
 
         history = need_rewind = None
@@ -263,27 +279,36 @@ class Rewind(object):
     def checkpoint_after_promote(self):
         return self._state == REWIND_STATUS.CHECKPOINT
 
-    def _fetch_missing_wal(self, restore_command, wal_filename):
+    def _buid_archiver_command(self, command, wal_filename):
+        """Replace placeholders in the given archiver command's template.
+        Applicable for archive_command and restore_command.
+        Can also be used for archive_cleanup_command and recovery_end_command,
+        however %r value is always set to 000000010000000000000001."""
         cmd = ''
-        length = len(restore_command)
+        length = len(command)
         i = 0
         while i < length:
-            if restore_command[i] == '%' and i + 1 < length:
+            if command[i] == '%' and i + 1 < length:
                 i += 1
-                if restore_command[i] == 'p':
+                if command[i] == 'p':
                     cmd += os.path.join(self._postgresql.wal_dir, wal_filename)
-                elif restore_command[i] == 'f':
+                elif command[i] == 'f':
                     cmd += wal_filename
-                elif restore_command[i] == 'r':
+                elif command[i] == 'r':
                     cmd += '000000010000000000000001'
-                elif restore_command[i] == '%':
+                elif command[i] == '%':
                     cmd += '%'
                 else:
                     cmd += '%'
                     i -= 1
             else:
-                cmd += restore_command[i]
+                cmd += command[i]
             i += 1
+
+        return cmd
+
+    def _fetch_missing_wal(self, restore_command, wal_filename):
+        cmd = self._buid_archiver_command(restore_command, wal_filename)
 
         logger.info('Trying to fetch the missing wal: %s', cmd)
         return self._postgresql.cancellable.call(shlex.split(cmd)) == 0
@@ -301,6 +326,42 @@ class Rewind(object):
                     if waldir.endswith('/pg_' + self._postgresql.wal_name) and len(wal_filename) == 24:
                         return wal_filename
 
+    def _archive_ready_wals(self):
+        """Try to archive WALs that have .ready files just in case
+        archive_mode was not set to 'always' before promote, while
+        after it the WALs were recycled on the promoted replica.
+        With this we prevent the entire loss of such WALs and the
+        consequent old leader's start failure."""
+        archive_mode = self._postgresql.get_guc_value('archive_mode')
+        archive_cmd = self._postgresql.get_guc_value('archive_command')
+        if archive_mode not in ('on', 'always') or not archive_cmd:
+            return
+
+        walseg_regex = re.compile(r'^[0-9A-F]{24}(\.partial){0,1}\.ready$')
+        status_dir = os.path.join(self._postgresql.wal_dir, 'archive_status')
+        try:
+            wals_to_archive = [f[:-6] for f in os.listdir(status_dir) if walseg_regex.match(f)]
+        except OSError as e:
+            return logger.error('Unable to list %s: %r', status_dir, e)
+
+        # skip fsync, as postgres --single or pg_rewind will anyway run it
+        for wal in sorted(wals_to_archive):
+            old_name = os.path.join(status_dir, wal + '.ready')
+            # wal file might have alredy been archived
+            if os.path.isfile(old_name) and os.path.isfile(os.path.join(self._postgresql.wal_dir, wal)):
+                cmd = self._buid_archiver_command(archive_cmd, wal)
+                # it is the author of archive_command, who is responsible
+                # for not overriding the WALs already present in archive
+                logger.info('Trying to archive %s: %s', wal, cmd)
+                if self._postgresql.cancellable.call(shlex.split(cmd)) == 0:
+                    new_name = os.path.join(status_dir, wal + '.done')
+                    try:
+                        shutil.move(old_name, new_name)
+                    except Exception as e:
+                        logger.error('Unable to rename %s to %s: %r', old_name, new_name, e)
+                else:
+                    logger.info('Failed to archive WAL segment %s', wal)
+
     def pg_rewind(self, r):
         # prepare pg_rewind connection
         env = self._postgresql.config.write_pgpass(r)
@@ -311,15 +372,18 @@ class Rewind(object):
         restore_command = self._postgresql.config.get('recovery_conf', {}).get('restore_command') \
             if self._postgresql.major_version < 120000 else self._postgresql.get_guc_value('restore_command')
 
-        # currently, pg_rewind expects postgresql.conf to be inside $PGDATA, which is not the case on e.g. Debian
-        # Fix this logic if e.g. PG15 receives an update for pg_rewind:
-        pg_rewind_can_restore = self._postgresql.major_version >= 130000 \
-            and restore_command \
-            and self._postgresql.config._config_dir == self._postgresql.data_dir
+        # Until v15 pg_rewind expected postgresql.conf to be inside $PGDATA, which is not the case on e.g. Debian
+        pg_rewind_can_restore = restore_command and (self._postgresql.major_version >= 150000 or
+                                                     (self._postgresql.major_version >= 130000 and
+                                                      self._postgresql.config._config_dir == self._postgresql.data_dir))
 
         cmd = [self._postgresql.pgcommand('pg_rewind')]
         if pg_rewind_can_restore:
             cmd.append('--restore-target-wal')
+            if self._postgresql.major_version >= 150000 and\
+                    self._postgresql.config._config_dir != self._postgresql.data_dir:
+                cmd.append('--config-file={0}'.format(self._postgresql.config.postgresql_conf))
+
         cmd.extend(['-D', self._postgresql.data_dir, '--source-server', dsn])
 
         while True:
@@ -350,6 +414,8 @@ class Rewind(object):
         if self._postgresql.is_running() and not self._postgresql.stop(checkpoint=False):
             return logger.warning('Can not run pg_rewind because postgres is still running')
 
+        self._archive_ready_wals()
+
         # prepare pg_rewind connection
         r = self._conn_kwargs(leader, self._postgresql.config.rewind_credentials)
 
@@ -374,19 +440,22 @@ class Rewind(object):
 
         if self.pg_rewind(r):
             self._state = REWIND_STATUS.SUCCESS
-        elif not self.check_leader_is_not_in_recovery(r):
-            logger.warning('Failed to rewind because master %s become unreachable', leader.name)
         else:
-            logger.error('Failed to rewind from healty master: %s', leader.name)
-
-            for name in ('remove_data_directory_on_rewind_failure', 'remove_data_directory_on_diverged_timelines'):
-                if self._postgresql.config.get(name):
-                    logger.warning('%s is set. removing...', name)
-                    self._postgresql.remove_data_directory()
-                    self._state = REWIND_STATUS.INITIAL
-                    break
+            if not self.check_leader_is_not_in_recovery(r):
+                logger.warning('Failed to rewind because master %s become unreachable', leader.name)
+                if not self.can_rewind:  # It is possible that the previous attempt damaged pg_control file!
+                    self._state = REWIND_STATUS.FAILED
             else:
+                logger.error('Failed to rewind from healty master: %s', leader.name)
                 self._state = REWIND_STATUS.FAILED
+
+            if self.failed:
+                for name in ('remove_data_directory_on_rewind_failure', 'remove_data_directory_on_diverged_timelines'):
+                    if self._postgresql.config.get(name):
+                        logger.warning('%s is set. removing...', name)
+                        self._postgresql.remove_data_directory()
+                        self._state = REWIND_STATUS.INITIAL
+                        break
         return False
 
     def reset_state(self):
@@ -445,6 +514,7 @@ class Rewind(object):
             logger.exception('Unable to list %s', status_dir)
 
     def ensure_clean_shutdown(self):
+        self._archive_ready_wals()
         self.cleanup_archive_status()
 
         # Start in a single user mode and stop to produce a clean shutdown

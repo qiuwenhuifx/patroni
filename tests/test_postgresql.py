@@ -95,7 +95,7 @@ class TestPostgresql(BaseTestPostgresql):
     @patch('subprocess.call', Mock(return_value=0))
     @patch('os.rename', Mock())
     @patch('patroni.postgresql.CallbackExecutor', Mock())
-    @patch.object(Postgresql, 'get_major_version', Mock(return_value=130000))
+    @patch.object(Postgresql, 'get_major_version', Mock(return_value=140000))
     @patch.object(Postgresql, 'is_running', Mock(return_value=True))
     def setUp(self):
         super(TestPostgresql, self).setUp()
@@ -287,6 +287,8 @@ class TestPostgresql(BaseTestPostgresql):
         mock_get_pg_settings.side_effect = Exception
         with patch('patroni.postgresql.config.mtime', mock_mtime):
             self.assertEqual(self.p.config.check_recovery_conf(None), (True, True))
+        with patch.object(Postgresql, 'is_starting', Mock(return_value=True)):
+            self.assertEqual(self.p.config.check_recovery_conf(None), (False, False))
 
     @patch.object(Postgresql, 'major_version', PropertyMock(return_value=100000))
     @patch.object(Postgresql, 'primary_conninfo', Mock(return_value='host=1'))
@@ -345,7 +347,7 @@ class TestPostgresql(BaseTestPostgresql):
     @patch('subprocess.Popen')
     def test_latest_checkpoint_location(self, mock_popen):
         mock_popen.return_value.communicate.return_value = (None, None)
-        self.assertEqual(self.p.latest_checkpoint_location(), '28163096')
+        self.assertEqual(self.p.latest_checkpoint_location(), 28163096)
         # 9.3 and 9.4 format
         mock_popen.return_value.communicate.side_effect = [
             (b'rmgr: XLOG        len (rec/tot):     72/   104, tx:          0, lsn: 0/01ADBC18, prev 0/01ADBBB8, ' +
@@ -353,14 +355,14 @@ class TestPostgresql(BaseTestPostgresql):
              b' 1; offset 0; oldest xid 715 in DB 1; oldest multi 1 in DB 1; oldest running xid 0; shutdown', None),
             (b'rmgr: Transaction len (rec/tot):     64/    96, tx:        726, lsn: 0/01ADBBB8, prev 0/01ADBB70, ' +
              b'bkp: 0000, desc: commit: 2021-02-26 11:19:37.900918 CET; inval msgs: catcache 11 catcache 10', None)]
-        self.assertEqual(self.p.latest_checkpoint_location(), '28163096')
+        self.assertEqual(self.p.latest_checkpoint_location(), 28163096)
         mock_popen.return_value.communicate.side_effect = [
             (b'rmgr: XLOG        len (rec/tot):     72/   104, tx:          0, lsn: 0/01ADBC18, prev 0/01ADBBB8, ' +
              b'bkp: 0000, desc: checkpoint: redo 0/1ADBC18; tli 1; prev tli 1; fpw true; xid 0/727; oid 16386; multi' +
              b' 1; offset 0; oldest xid 715 in DB 1; oldest multi 1 in DB 1; oldest running xid 0; shutdown', None),
             (b'rmgr: XLOG        len (rec/tot):      0/    32, tx:          0, lsn: 0/01ADBBB8, prev 0/01ADBBA0, ' +
              b'bkp: 0000, desc: xlog switch ', None)]
-        self.assertEqual(self.p.latest_checkpoint_location(), '28163000')
+        self.assertEqual(self.p.latest_checkpoint_location(), 28163000)
         # 9.5+ format
         mock_popen.return_value.communicate.side_effect = [
             (b'rmgr: XLOG        len (rec/tot):    114/   114, tx:          0, lsn: 0/01ADBC18, prev 0/018260F8, ' +
@@ -369,7 +371,7 @@ class TestPostgresql(BaseTestPostgresql):
              b' oldest running xid 0; shutdown', None),
             (b'rmgr: XLOG        len (rec/tot):     24/    24, tx:          0, lsn: 0/018260F8, prev 0/01826080, ' +
              b'desc: SWITCH ', None)]
-        self.assertEqual(self.p.latest_checkpoint_location(), '25321720')
+        self.assertEqual(self.p.latest_checkpoint_location(), 25321720)
 
     def test_reload(self):
         self.assertTrue(self.p.reload())

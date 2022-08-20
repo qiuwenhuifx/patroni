@@ -307,7 +307,8 @@ class Ha(object):
 
         if self._rewind.can_rewind:
             # rewind is required, but postgres wasn't shut down cleanly.
-            if self.state_handler.controldata().get('Database cluster state') == 'in archive recovery':
+            if not self.state_handler.is_running() and \
+                    self.state_handler.controldata().get('Database cluster state') == 'in archive recovery':
                 msg = self._handle_crash_recovery()
                 if msg:
                     return msg
@@ -315,8 +316,7 @@ class Ha(object):
             msg = 'running pg_rewind from ' + leader.name
             return self._async_executor.try_run_async(msg, self._rewind.execute, args=(leader,)) or msg
 
-        # remove_data_directory_on_diverged_timelines is set
-        if not self.is_standby_cluster():
+        if self._rewind.should_remove_data_directory_on_diverged_timelines and not self.is_standby_cluster():
             msg = 'reinitializing due to diverged timelines'
             return self._async_executor.try_run_async(msg, self._do_reinitialize, args=(self.cluster,)) or msg
 
@@ -423,9 +423,10 @@ class Ha(object):
                 self.state_handler.get_history(self._leader_timeline + 1):
             self._rewind.trigger_check_diverged_lsn()
 
-        msg = self._handle_rewind_or_reinitialize()
-        if msg:
-            return msg
+        if not self.state_handler.is_starting():
+            msg = self._handle_rewind_or_reinitialize()
+            if msg:
+                return msg
 
         if not self.is_paused():
             self.state_handler.handle_parameter_change()
@@ -1406,7 +1407,14 @@ class Ha(object):
                     return 'started as a secondary'
 
             # is data directory empty?
-            if self.state_handler.data_directory_empty():
+            try:
+                data_directory_is_empty = self.state_handler.data_directory_empty()
+                data_directory_is_accessible = True
+            except OSError as e:
+                data_directory_is_accessible = False
+                data_directory_error = e
+
+            if not data_directory_is_accessible or data_directory_is_empty:
                 self.state_handler.set_role('uninitialized')
                 self.state_handler.stop('immediate', stop_timeout=self.patroni.config['retry_timeout'])
                 # In case datadir went away while we were master.
@@ -1415,8 +1423,11 @@ class Ha(object):
                 # is this instance the leader?
                 if self.has_lock():
                     self.release_leader_key_voluntarily()
-                    return 'released leader key voluntarily as data dir empty and currently leader'
+                    return 'released leader key voluntarily as data dir {0} and currently leader'.format(
+                                'empty' if data_directory_is_accessible else 'not accessible')
 
+                if not data_directory_is_accessible:
+                    return 'data directory is not accessible: {0}'.format(data_directory_error)
                 if self.is_paused():
                     return 'running with empty data directory'
                 return self.bootstrap()  # new node
@@ -1482,7 +1493,9 @@ class Ha(object):
                 # asynchronous processes are running (should be always the case for the master)
                 if not self._async_executor.busy and not self.state_handler.is_starting():
                     create_slots = self.state_handler.slots_handler.sync_replication_slots(self.cluster,
-                                                                                           self.patroni.nofailover)
+                                                                                           self.patroni.nofailover,
+                                                                                           self.patroni.replicatefrom,
+                                                                                           self.is_paused())
                     if not self.state_handler.cb_called:
                         if not self.state_handler.is_leader():
                             self._rewind.trigger_check_diverged_lsn()

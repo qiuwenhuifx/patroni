@@ -131,7 +131,7 @@ Most of the parameters are optional, but you have to specify one of the **host**
 -  **checks**: (optional) list of Consul health checks used for the session. By default an empty list is used.
 -  **register\_service**: (optional) whether or not to register a service with the name defined by the scope parameter and the tag master, replica or standby-leader depending on the node's role. Defaults to **false**.
 -  **service\_tags**: (optional) additional static tags to add to the Consul service apart from the role (``master``/``replica``/``standby-leader``).  By default an empty list is used.
--  **service\_check\_interval**: (optional) how often to perform health check against registered url.
+-  **service\_check\_interval**: (optional) how often to perform health check against registered url. Defaults to '5s'.
 -  **service\_check\_tls\_server\_name**: (optional) overide SNI host when connecting via TLS, see also `consul agent check API reference <https://www.consul.io/api-docs/agent/check#tlsservername>`__.
 
 The ``token`` needs to have the following ACL permissions:
@@ -224,7 +224,7 @@ Raft
 
   - Q: How to list all the nodes providing consensus?
 
-    A: ``syncobj_admin -conn host:port`` -status where the host:port is the address of one of the cluster nodes
+    A: ``syncobj_admin -conn host:port -status`` where the host:port is the address of one of the cluster nodes
 
   - Q: Node that was a part of consensus and has gone and I can't reuse the same IP for other node. How to remove this node from the consensus?
 
@@ -314,7 +314,7 @@ PostgreSQL
     -  **pg\_ctl\_timeout**: How long should pg_ctl wait when doing ``start``, ``stop`` or ``restart``. Default value is 60 seconds.
     -  **use\_pg\_rewind**: try to use pg\_rewind on the former leader when it joins cluster as a replica.
     -  **remove\_data\_directory\_on\_rewind\_failure**: If this option is enabled, Patroni will remove the PostgreSQL data directory and recreate the replica. Otherwise it will try to follow the new leader. Default value is **false**.
-    -  **remove\_data\_directory\_on\_diverged\_timelines**: Patroni will remove the PostgreSQL data directory and recreate the replica if it notices that timelines are diverging and the former master can not start streaming from the new master. This option is useful when ``pg_rewind`` can not be used. Default value is **false**.
+    -  **remove\_data\_directory\_on\_diverged\_timelines**: Patroni will remove the PostgreSQL data directory and recreate the replica if it notices that timelines are diverging and the former master can not start streaming from the new master. This option is useful when ``pg_rewind`` can not be used. While performing timelines divergence check on PostgreSQL v10 and older Patroni will try to connect with replication credential to the "postgres" database. Hence, such access should be allowed in the  pg_hba.conf. Default value is **false**.
     -  **replica\_method**: for each create_replica_methods other than basebackup, you would add a configuration section of the same name. At a minimum, this should include "command" with a full path to the actual script to be executed. Other configuration parameters will be passed along to the script in the form "parameter=value".
     -  **pre\_promote**: a fencing script that executes during a failover after acquiring the leader lock but before promoting the replica. If the script exits with a non-zero code, Patroni does not promote the replica and removes the leader key from DCS.
 

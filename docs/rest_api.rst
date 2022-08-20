@@ -7,7 +7,7 @@ Patroni has a rich REST API, which is used by Patroni itself during the leader r
 
 Health check endpoints
 ----------------------
-For all health check ``GET`` requests Patroni returns a JSON document with the status of the node, along with the HTTP status code. If you don't want or don't need the JSON document, you might consider using the ``OPTIONS`` method instead of ``GET``.
+For all health check ``GET`` requests Patroni returns a JSON document with the status of the node, along with the HTTP status code. If you don't want or don't need the JSON document, you might consider using the ``HEAD`` or ``OPTIONS`` method instead of ``GET``.
 
 - The following requests to Patroni REST API will return HTTP status code **200** only when the Patroni node is running as the primary with leader lock:
 
@@ -44,7 +44,10 @@ For all health check ``GET`` requests Patroni returns a JSON document with the s
 
 - ``GET /synchronous`` or ``GET /sync``: returns HTTP status code **200** only when the Patroni node is running as a synchronous standby.
 
+- ``GET /read-only-sync``: like the above endpoint, but also includes the primary.
+
 - ``GET /asynchronous`` or ``GET /async``: returns HTTP status code **200** only when the Patroni node is running as an asynchronous standby.
+
 
 - ``GET /asynchronous?lag=<max-lag>`` or ``GET /async?lag=<max-lag>``: asynchronous standby check endpoint. In addition to checks from ``asynchronous`` or ``async``, it also checks replication latency and returns status code **200** only when it is below specified value. The key cluster.last_leader_operation from DCS is used for Leader wal position and compute latency on replica for performance reasons. max-lag can be specified in bytes (integer) or in human readable values, for e.g. 16kB, 64MB, 1GB.
 

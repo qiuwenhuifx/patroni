@@ -38,6 +38,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
         self.log_request(status_code)
 
     def _write_response(self, status_code, body, content_type='text/html', headers=None):
+        # TODO: try-catch ConnectionResetError: [Errno 104] Connection reset by peer and log it in DEBUG level
         self.send_response(status_code)
         headers = headers or {}
         if content_type:
@@ -141,7 +142,7 @@ class RestApiHandler(BaseHTTPRequestHandler):
             ignore_tags = True
         elif 'replica' in path:
             status_code = replica_status_code
-        elif 'read-only' in path:
+        elif 'read-only' in path and 'sync' not in path:
             status_code = 200 if 200 in (primary_status_code, standby_leader_status_code) else replica_status_code
         elif 'health' in path:
             status_code = 200 if response.get('state') == 'running' else 503
@@ -152,6 +153,11 @@ class RestApiHandler(BaseHTTPRequestHandler):
                 status_code = replica_status_code
             elif path in ('/async', '/asynchronous') and not is_synchronous:
                 status_code = replica_status_code
+            elif path in ('/read-only-sync', '/read-only-synchronous'):
+                if 200 in (primary_status_code, standby_leader_status_code):
+                    status_code = 200
+                elif is_synchronous:
+                    status_code = replica_status_code
 
         # check for user defined tags in query params
         if not ignore_tags and status_code == 200:
@@ -178,6 +184,9 @@ class RestApiHandler(BaseHTTPRequestHandler):
             self._write_status_response(status_code, response)
 
     def do_OPTIONS(self):
+        self.do_GET(write_status_code_only=True)
+
+    def do_HEAD(self):
         self.do_GET(write_status_code_only=True)
 
     def do_GET_liveness(self):
