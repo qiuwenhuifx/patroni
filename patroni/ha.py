@@ -192,6 +192,10 @@ class Ha(object):
                 'version': self.patroni.version
             }
 
+            proxy_url = self.state_handler.proxy_url
+            if proxy_url:
+                data['proxy_url'] = proxy_url
+
             if self.is_leader() and not self._rewind.checkpoint_after_promote():
                 data['checkpoint_after_promote'] = False
             tags = self.get_effective_tags()
@@ -273,7 +277,9 @@ class Ha(object):
         else:
             create_replica_methods = self.get_standby_cluster_config().get('create_replica_methods', []) \
                                      if self.is_standby_cluster() else None
-            if self.state_handler.can_create_replica_without_replication_connection(create_replica_methods):
+            can_bootstrap = self.state_handler.can_create_replica_without_replication_connection(create_replica_methods)
+            concurrent_bootstrap = self.cluster.initialize == ""
+            if can_bootstrap and not concurrent_bootstrap:
                 msg = 'bootstrap (without leader)'
                 return self._async_executor.try_run_async(msg, self.clone) or 'trying to ' + msg
             return 'waiting for {0}leader to bootstrap'.format('standby_' if self.is_standby_cluster() else '')
@@ -737,6 +743,11 @@ class Ha(object):
                     return None
                 return False
 
+            # in synchronous mode when our name is not in the /sync key
+            # we shouldn't take any action even if the candidate is unhealthy
+            if self.is_synchronous_mode() and not self.cluster.sync.matches(self.state_handler.name):
+                return False
+
             # find specific node and check that it is healthy
             member = self.cluster.get_member(failover.candidate, fallback_to_leader=False)
             if member:
@@ -797,7 +808,7 @@ class Ha(object):
         if self.cluster.failover:
             # When doing a switchover in synchronous mode only synchronous nodes and former leader are allowed to race
             if self.is_synchronous_mode() and self.cluster.failover.leader and \
-                    self.cluster.failover.candidate and not self.cluster.sync.matches(self.state_handler.name):
+                    not self.cluster.sync.matches(self.state_handler.name):
                 return False
             return self.manual_failover_process_no_leader()
 

@@ -7,10 +7,11 @@ from datetime import datetime, timedelta
 from mock import patch, Mock
 from patroni.ctl import ctl, store_config, load_config, output_members, get_dcs, parse_dcs, \
     get_all_members, get_any_member, get_cursor, query_member, configure, PatroniCtlException, apply_config_changes, \
-    format_config_for_editing, show_diff, invoke_editor, format_pg_version, CONFIG_FILE_PATH
+    format_config_for_editing, show_diff, invoke_editor, format_pg_version, CONFIG_FILE_PATH, PatronictlPrettyTable
 from patroni.dcs.etcd import AbstractEtcdClientWithFailover, Failover
 from patroni.psycopg import OperationalError
 from patroni.utils import tzutc
+from prettytable import PrettyTable, ALL
 from urllib3 import PoolManager
 
 from . import MockConnect, MockCursor, MockResponse, psycopg_connect
@@ -562,7 +563,8 @@ class TestCtl(unittest.TestCase):
 
     @patch('sys.stdout.isatty', return_value=False)
     @patch('patroni.ctl.markup_to_pager')
-    def test_show_diff(self, mock_markup_to_pager, mock_isatty):
+    @patch('patroni.ctl.find_executable', return_value=None)
+    def test_show_diff(self, mock_find_executable, mock_markup_to_pager, mock_isatty):
         show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
         mock_markup_to_pager.assert_not_called()
 
@@ -570,10 +572,10 @@ class TestCtl(unittest.TestCase):
         show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
         mock_markup_to_pager.assert_called_once()
 
-        with patch('patroni.ctl.find_executable', Mock(return_value=None)):
-            show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
+        show_diff("foo:\n  bar: 1\n", "foo:\n  bar: 2\n")
 
         # Test that unicode handling doesn't fail with an exception
+        mock_find_executable.return_value = '/usr/bin/less'
         show_diff(b"foo:\n  bar: \xc3\xb6\xc3\xb6\n".decode('utf-8'),
                   b"foo:\n  bar: \xc3\xbc\xc3\xbc\n".decode('utf-8'))
 
@@ -591,6 +593,7 @@ class TestCtl(unittest.TestCase):
         self.runner.invoke(ctl, ['show-config', 'dummy'])
 
     @patch('patroni.ctl.get_dcs')
+    @patch('subprocess.call', Mock(return_value=0))
     def test_edit_config(self, mock_get_dcs):
         mock_get_dcs.return_value = self.e
         mock_get_dcs.return_value.get_cluster = get_cluster_initialized_with_leader
@@ -646,3 +649,24 @@ class TestCtl(unittest.TestCase):
             result = self.runner.invoke(ctl, ['reinit', 'alpha', 'other', '--wait'], input='y\ny')
         self.assertIn("Waiting for reinitialize to complete on: other", result.output)
         self.assertIn("Reinitialize is completed on: other", result.output)
+
+
+class TestPatronictlPrettyTable(unittest.TestCase):
+
+    def setUp(self):
+        self.pt = PatronictlPrettyTable(' header', ['foo', 'bar'], hrules=ALL)
+
+    def test__get_hline(self):
+        expected = '+-----+-----+'
+        self.pt._hrule = expected
+        self.assertEqual(self.pt._hrule, '+ header----+')
+        self.assertFalse(self.pt._is_first_hline())
+        self.assertEqual(self.pt._hrule, expected)
+
+    @patch.object(PrettyTable, '_stringify_hrule', Mock(return_value='+-----+-----+'))
+    def test__stringify_hrule(self):
+        self.assertEqual(self.pt._stringify_hrule((), 'top_'), '+ header----+')
+        self.assertFalse(self.pt._is_first_hline())
+
+    def test_output(self):
+        self.assertEqual(str(self.pt), '+ header----+\n| foo | bar |\n+-----+-----+')
