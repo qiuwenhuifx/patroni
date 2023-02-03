@@ -10,10 +10,12 @@ import sys
 import time
 import urllib3
 
+from collections import defaultdict
 from threading import Condition, Lock, Thread
 from urllib3.exceptions import ReadTimeoutError, ProtocolError
 
-from . import ClusterConfig, Cluster, Failover, Leader, Member, SyncState, TimelineHistory
+from . import ClusterConfig, Cluster, Failover, Leader, Member, SyncState,\
+        TimelineHistory, ReturnFalseException, catch_return_false_exception, citus_group_re
 from .etcd import AbstractEtcdClientWithFailover, AbstractEtcd, catch_etcd_errors
 from ..exceptions import DCSError, PatroniException
 from ..utils import deep_compare, enable_keepalive, iter_response_objects, RetryFailedError, USER_AGENT
@@ -90,7 +92,7 @@ class Unavailable(Etcd3ClientError):
     code = GRPCCode.Unavailable
 
 
-# https://github.com/etcd-io/etcd/blob/master/etcdserver/api/v3rpc/rpctypes/error.go
+# https://github.com/etcd-io/etcd/commits/main/api/v3rpc/rpctypes/error.go
 class LeaseNotFound(NotFound):
     error = "etcdserver: requested lease not found"
 
@@ -557,13 +559,18 @@ class PatroniEtcd3Client(Etcd3Client):
                 raise RetryFailedError('Exceeded retry deadline')
             self._kv_cache.condition.wait(timeout)
 
-    def get_cluster(self):
-        if self._kv_cache:
+    def get_cluster(self, path):
+        if self._kv_cache and path.startswith(self._etcd3.cluster_prefix):
             with self._kv_cache.condition:
                 self._wait_cache(self._etcd3._retry.deadline)
-                return self._kv_cache.copy()
+                ret = self._kv_cache.copy()
         else:
-            return self._etcd3.retry(self.prefix, self._etcd3.cluster_prefix).get('kvs', [])
+            ret = self._etcd3.retry(self.prefix, path).get('kvs', [])
+        for node in ret:
+            node.update({'key': base64_decode(node['key']),
+                         'value': base64_decode(node.get('value', '')),
+                         'lease': node.get('lease')})
+        return ret
 
     def call_rpc(self, method, fields, retry=None):
         ret = super(PatroniEtcd3Client, self).call_rpc(method, fields, retry)
@@ -609,8 +616,8 @@ class Etcd3(AbstractEtcd):
         if self.__do_not_watch:
             self._lease = None
 
-    def _do_refresh_lease(self, retry=None):
-        if self._lease and self._last_lease_refresh + self._loop_wait > time.time():
+    def _do_refresh_lease(self, force=False, retry=None):
+        if not force and self._lease and self._last_lease_refresh + self._loop_wait > time.time():
             return False
 
         if self._lease and not self._client.lease_keepalive(self._lease, retry):
@@ -640,78 +647,94 @@ class Etcd3(AbstractEtcd):
 
     @property
     def cluster_prefix(self):
-        return self.client_path('')
+        return self._base_path + '/' if self.is_citus_coordinator() else self.client_path('')
 
     @staticmethod
     def member(node):
         return Member.from_node(node['mod_revision'], os.path.basename(node['key']), node['lease'], node['value'])
 
-    def _load_cluster(self):
+    def _cluster_from_nodes(self, nodes):
+        # get initialize flag
+        initialize = nodes.get(self._INITIALIZE)
+        initialize = initialize and initialize['value']
+
+        # get global dynamic configuration
+        config = nodes.get(self._CONFIG)
+        config = config and ClusterConfig.from_node(config['mod_revision'], config['value'])
+
+        # get timeline history
+        history = nodes.get(self._HISTORY)
+        history = history and TimelineHistory.from_node(history['mod_revision'], history['value'])
+
+        # get last know leader lsn and slots
+        status = nodes.get(self._STATUS)
+        if status:
+            try:
+                status = json.loads(status['value'])
+                last_lsn = status.get(self._OPTIME)
+                slots = status.get('slots')
+            except Exception:
+                slots = last_lsn = None
+        else:
+            last_lsn = nodes.get(self._LEADER_OPTIME)
+            last_lsn = last_lsn and last_lsn['value']
+            slots = None
+
+        try:
+            last_lsn = int(last_lsn)
+        except Exception:
+            last_lsn = 0
+
+        # get list of members
+        members = [self.member(n) for k, n in nodes.items() if k.startswith(self._MEMBERS) and k.count('/') == 1]
+
+        # get leader
+        leader = nodes.get(self._LEADER)
+        if not self._ctl and leader and leader['value'] == self._name and self._lease != leader.get('lease'):
+            logger.warning('I am the leader but not owner of the lease')
+
+        if leader:
+            member = Member(-1, leader['value'], None, {})
+            member = ([m for m in members if m.name == leader['value']] or [member])[0]
+            leader = Leader(leader['mod_revision'], leader['lease'], member)
+
+        # failover key
+        failover = nodes.get(self._FAILOVER)
+        if failover:
+            failover = Failover.from_node(failover['mod_revision'], failover['value'])
+
+        # get synchronization state
+        sync = nodes.get(self._SYNC)
+        sync = SyncState.from_node(sync and sync['mod_revision'], sync and sync['value'])
+
+        # get failsafe topology
+        failsafe = nodes.get(self._FAILSAFE)
+        try:
+            failsafe = json.loads(failsafe['value']) if failsafe else None
+        except Exception:
+            failsafe = None
+
+        return Cluster(initialize, config, leader, last_lsn, members, failover, sync, history, slots, failsafe)
+
+    def _cluster_loader(self, path):
+        nodes = {node['key'][len(path):]: node
+                 for node in self._client.get_cluster(path)
+                 if node['key'].startswith(path)}
+        return self._cluster_from_nodes(nodes)
+
+    def _citus_cluster_loader(self, path):
+        clusters = defaultdict(dict)
+        path = self._base_path + '/'
+        for node in self._client.get_cluster(path):
+            key = node['key'][len(path):].split('/', 1)
+            if len(key) == 2 and citus_group_re.match(key[0]):
+                clusters[int(key[0])][key[1]] = node
+        return {group: self._cluster_from_nodes(nodes) for group, nodes in clusters.items()}
+
+    def _load_cluster(self, path, loader):
         cluster = None
         try:
-            path_len = len(self.cluster_prefix)
-
-            nodes = {}
-            for node in self._client.get_cluster():
-                node['key'] = base64_decode(node['key'])
-                node['value'] = base64_decode(node.get('value', ''))
-                node['lease'] = node.get('lease')
-                nodes[node['key'][path_len:].lstrip('/')] = node
-
-            # get initialize flag
-            initialize = nodes.get(self._INITIALIZE)
-            initialize = initialize and initialize['value']
-
-            # get global dynamic configuration
-            config = nodes.get(self._CONFIG)
-            config = config and ClusterConfig.from_node(config['mod_revision'], config['value'])
-
-            # get timeline history
-            history = nodes.get(self._HISTORY)
-            history = history and TimelineHistory.from_node(history['mod_revision'], history['value'])
-
-            # get last know leader lsn and slots
-            status = nodes.get(self._STATUS)
-            if status:
-                try:
-                    status = json.loads(status['value'])
-                    last_lsn = status.get(self._OPTIME)
-                    slots = status.get('slots')
-                except Exception:
-                    slots = last_lsn = None
-            else:
-                last_lsn = nodes.get(self._LEADER_OPTIME)
-                last_lsn = last_lsn and last_lsn['value']
-                slots = None
-
-            try:
-                last_lsn = int(last_lsn)
-            except Exception:
-                last_lsn = 0
-
-            # get list of members
-            members = [self.member(n) for k, n in nodes.items() if k.startswith(self._MEMBERS) and k.count('/') == 1]
-
-            # get leader
-            leader = nodes.get(self._LEADER)
-            if not self._ctl and leader and leader['value'] == self._name and self._lease != leader.get('lease'):
-                logger.warning('I am the leader but not owner of the lease')
-
-            if leader:
-                member = Member(-1, leader['value'], None, {})
-                member = ([m for m in members if m.name == leader['value']] or [member])[0]
-                leader = Leader(leader['mod_revision'], leader['lease'], member)
-
-            # failover key
-            failover = nodes.get(self._FAILOVER)
-            if failover:
-                failover = Failover.from_node(failover['mod_revision'], failover['value'])
-
-            # get synchronization state
-            sync = nodes.get(self._SYNC)
-            sync = SyncState.from_node(sync and sync['mod_revision'], sync and sync['value'])
-
-            cluster = Cluster(initialize, config, leader, last_lsn, members, failover, sync, history, slots)
+            cluster = loader(path)
         except UnsupportedEtcdVersion:
             raise
         except Exception as e:
@@ -720,12 +743,11 @@ class Etcd3(AbstractEtcd):
         return cluster
 
     @catch_etcd_errors
-    def touch_member(self, data, permanent=False):
-        if not permanent:
-            try:
-                self.refresh_lease()
-            except Etcd3Error:
-                return False
+    def touch_member(self, data):
+        try:
+            self.refresh_lease()
+        except Etcd3Error:
+            return False
 
         cluster = self.cluster
         member = cluster and cluster.get_member(self._name, fallback_to_leader=False)
@@ -735,7 +757,7 @@ class Etcd3(AbstractEtcd):
 
         data = json.dumps(data, separators=(',', ':'))
         try:
-            return self._client.put(self.member_path, data, None if permanent else self._lease)
+            return self._client.put(self.member_path, data, self._lease)
         except LeaseNotFound:
             self._lease = None
             logger.error('Our lease disappeared from Etcd, can not "touch_member"')
@@ -744,21 +766,41 @@ class Etcd3(AbstractEtcd):
     def take_leader(self):
         return self.retry(self._client.put, self.leader_path, self._name, self._lease)
 
-    @catch_etcd_errors
-    def _do_attempt_to_acquire_leader(self, permanent):
+    def _do_attempt_to_acquire_leader(self, retry):
+        def _retry(*args, **kwargs):
+            kwargs['retry'] = retry
+            return retry(*args, **kwargs)
+
         try:
-            return self.retry(self._client.put, self.leader_path, self._name, None if permanent else self._lease, 0)
+            return _retry(self._client.put, self.leader_path, self._name, self._lease, 0)
         except LeaseNotFound:
-            self._lease = None
             logger.error('Our lease disappeared from Etcd. Will try to get a new one and retry attempt')
-            self.refresh_lease()
-            return self.retry(self._client.put, self.leader_path, self._name, None if permanent else self._lease, 0)
+            self._lease = None
+            retry.deadline = retry.stoptime - time.time()
 
-    def attempt_to_acquire_leader(self, permanent=False):
-        if not self._lease and not permanent:
-            self.refresh_lease()
+            _retry(self._do_refresh_lease)
 
-        ret = self._do_attempt_to_acquire_leader(permanent)
+            retry.deadline = retry.stoptime - time.time()
+            if retry.deadline < 1:
+                raise Etcd3Error('_do_attempt_to_acquire_leader timeout')
+
+            return _retry(self._client.put, self.leader_path, self._name, self._lease, 0)
+
+    @catch_return_false_exception
+    def attempt_to_acquire_leader(self):
+        retry = self._retry.copy()
+
+        def _retry(*args, **kwargs):
+            kwargs['retry'] = retry
+            return retry(*args, **kwargs)
+
+        self._run_and_handle_exceptions(self._do_refresh_lease, retry=_retry)
+
+        retry.deadline = retry.stoptime - time.time()
+        if retry.deadline < 1:
+            raise Etcd3Error('attempt_to_acquire_leader timeout')
+
+        ret = self._run_and_handle_exceptions(self._do_attempt_to_acquire_leader, retry, retry=None)
         if not ret:
             logger.info('Could not take out TTL lock')
         return ret
@@ -780,17 +822,32 @@ class Etcd3(AbstractEtcd):
         return self._client.put(self.status_path, value)
 
     @catch_etcd_errors
+    def _write_failsafe(self, value):
+        return self._client.put(self.failsafe_path, value)
+
+    @catch_return_false_exception
     def _update_leader(self):
-        if not self._lease:
-            self.refresh_lease()
-        elif self.retry(self._client.lease_keepalive, self._lease):
-            self._last_lease_refresh = time.time()
+        retry = self._retry.copy()
+
+        def _retry(*args, **kwargs):
+            kwargs['retry'] = retry
+            return retry(*args, **kwargs)
+
+        self._run_and_handle_exceptions(self._do_refresh_lease, True, retry=_retry)
 
         if self._lease:
             cluster = self.cluster
             leader_lease = cluster and isinstance(cluster.leader, Leader) and cluster.leader.session
             if leader_lease != self._lease:
-                self.take_leader()
+                retry.deadline = retry.stoptime - time.time()
+                if retry.deadline < 1:
+                    raise Etcd3Error('update_leader timeout')
+
+                try:
+                    self._run_and_handle_exceptions(self._client.put, self.leader_path,
+                                                    self._name, self._lease, retry=_retry)
+                except ReturnFalseException:
+                    pass
         return bool(self._lease)
 
     @catch_etcd_errors
@@ -809,7 +866,7 @@ class Etcd3(AbstractEtcd):
 
     @catch_etcd_errors
     def delete_cluster(self):
-        return self.retry(self._client.deleteprefix, self.cluster_prefix)
+        return self.retry(self._client.deleteprefix, self.client_path(''))
 
     @catch_etcd_errors
     def set_history_value(self, value):
