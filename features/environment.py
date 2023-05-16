@@ -7,7 +7,7 @@ import psutil
 import re
 import shutil
 import signal
-import six
+import stat
 import subprocess
 import sys
 import tempfile
@@ -17,12 +17,11 @@ import yaml
 
 import patroni.psycopg as psycopg
 
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from patroni.request import PatroniRequest
-from six.moves.BaseHTTPServer import BaseHTTPRequestHandler, HTTPServer
 
 
-@six.add_metaclass(abc.ABCMeta)
-class AbstractController(object):
+class AbstractController(abc.ABC):
 
     def __init__(self, context, name, work_directory, output_dir):
         self._context = context
@@ -193,7 +192,7 @@ class PatroniController(AbstractController):
             config['raft'] = {'data_dir': self._output_dir, 'self_addr': 'localhost:' + os.environ['RAFT_PORT']}
 
         host = config['restapi']['listen'].rsplit(':', 1)[0]
-        config['restapi']['listen'] = config['restapi']['connect_address'] = '{0}:{1}'.format(host, 8008+int(name[-1]))
+        config['restapi']['listen'] = config['restapi']['connect_address'] = '{}:{}'.format(host, 8008 + int(name[-1]))
 
         host = config['postgresql']['listen'].rsplit(':', 1)[0]
         config['postgresql']['listen'] = config['postgresql']['connect_address'] = '{0}:{1}'.format(host, self.__PORT)
@@ -201,6 +200,8 @@ class PatroniController(AbstractController):
         config['name'] = name
         config['postgresql']['data_dir'] = self._data_dir.replace('\\', '/')
         config['postgresql']['basebackup'] = [{'checkpoint': 'fast'}]
+        config['postgresql']['callbacks'] = {
+            'on_role_change': '{0} features/callback2.py {1}'.format(self._context.pctl.PYTHON, name)}
         config['postgresql']['use_unix_socket'] = os.name != 'nt'  # windows doesn't yet support unix-domain sockets
         config['postgresql']['use_unix_socket_repl'] = os.name != 'nt'
         config['postgresql']['pgpass'] = os.path.join(tempfile.gettempdir(), 'pgpass_' + name).replace('\\', '/')
@@ -251,9 +252,9 @@ class PatroniController(AbstractController):
                         'parameters': {
                             'wal_keep_segments': 100,
                             'archive_mode': 'on',
-                            'archive_command': (PatroniPoolController.ARCHIVE_RESTORE_SCRIPT +
-                                                ' --mode archive ' +
-                                                '--dirname {} --filename %f --pathname %p').format(
+                            'archive_command': (PatroniPoolController.ARCHIVE_RESTORE_SCRIPT
+                                                + ' --mode archive '
+                                                + '--dirname {} --filename %f --pathname %p').format(
                                                     os.path.join(self._work_directory, 'data', 'wal_archive'))
                         }
                     }
@@ -801,7 +802,7 @@ class PatroniPoolController(object):
             raise Exception  # this one should never happen because the previous line will always raise and exception
         except Exception as e:
             self._context.postgres_supports_ssl = isinstance(e, subprocess.CalledProcessError)\
-                    and 'SSL is not supported by this build' not in e.output.decode()
+                and 'SSL is not supported by this build' not in e.output.decode()
 
     @property
     def patroni_path(self):
@@ -853,8 +854,8 @@ class PatroniPoolController(object):
             'bootstrap': {
                 'method': 'pg_basebackup',
                 'pg_basebackup': {
-                    'command': " ".join(self.BACKUP_SCRIPT +
-                                        ['--walmethod=stream', '--dbname="{0}"'.format(f.backup_source)])
+                    'command': " ".join(self.BACKUP_SCRIPT
+                                        + ['--walmethod=stream', '--dbname="{0}"'.format(f.backup_source)])
                 },
                 'dcs': {
                     'postgresql': {
@@ -867,9 +868,9 @@ class PatroniPoolController(object):
             'postgresql': {
                 'parameters': {
                     'archive_mode': 'on',
-                    'archive_command': (self.ARCHIVE_RESTORE_SCRIPT + ' --mode archive ' +
-                                        '--dirname {} --filename %f --pathname %p').format(
-                                        os.path.join(self.patroni_path, 'data', 'wal_archive_clone').replace('\\', '/'))
+                    'archive_command': (self.ARCHIVE_RESTORE_SCRIPT + ' --mode archive '
+                                        + '--dirname {} --filename %f --pathname %p')
+                    .format(os.path.join(self.patroni_path, 'data', 'wal_archive_clone').replace('\\', '/'))
                 },
                 'authentication': {
                     'superuser': {'password': 'zalando1'},
@@ -885,13 +886,13 @@ class PatroniPoolController(object):
             'bootstrap': {
                 'method': 'backup_restore',
                 'backup_restore': {
-                    'command': (self.BACKUP_RESTORE_SCRIPT + ' --sourcedir=' +
-                                os.path.join(self.patroni_path, 'data', 'basebackup').replace('\\', '/')),
+                    'command': (self.BACKUP_RESTORE_SCRIPT + ' --sourcedir='
+                                + os.path.join(self.patroni_path, 'data', 'basebackup').replace('\\', '/')),
                     'recovery_conf': {
                         'recovery_target_action': 'promote',
                         'recovery_target_timeline': 'latest',
-                        'restore_command': (self.ARCHIVE_RESTORE_SCRIPT + ' --mode restore ' +
-                                            '--dirname {} --filename %f --pathname %p').format(
+                        'restore_command': (self.ARCHIVE_RESTORE_SCRIPT + ' --mode restore '
+                                            + '--dirname {} --filename %f --pathname %p').format(
                             os.path.join(self.patroni_path, 'data', 'wal_archive_clone').replace('\\', '/'))
                     }
                 }
@@ -910,14 +911,14 @@ class PatroniPoolController(object):
             'scope': cluster_name,
             'postgresql': {
                 'recovery_conf': {
-                    'restore_command': (self.ARCHIVE_RESTORE_SCRIPT + ' --mode restore ' +
-                                        '--dirname {} --filename %f --pathname %p').format(
-                                        os.path.join(self.patroni_path, 'data', 'wal_archive').replace('\\', '/'))
+                    'restore_command': (self.ARCHIVE_RESTORE_SCRIPT + ' --mode restore '
+                                        + '--dirname {} --filename %f --pathname %p')
+                    .format(os.path.join(self.patroni_path, 'data', 'wal_archive').replace('\\', '/'))
                 },
                 'create_replica_methods': ['no_leader_bootstrap'],
                 'no_leader_bootstrap': {
-                    'command': (self.BACKUP_RESTORE_SCRIPT + ' --sourcedir=' +
-                                os.path.join(self.patroni_path, 'data', 'basebackup').replace('\\', '/')),
+                    'command': (self.BACKUP_RESTORE_SCRIPT + ' --sourcedir='
+                                + os.path.join(self.patroni_path, 'data', 'basebackup').replace('\\', '/')),
                     'no_leader': '1'
                 }
             }
@@ -1060,9 +1061,11 @@ def before_all(context):
     try:
         with open(os.devnull, 'w') as null:
             ret = subprocess.call(['openssl', 'req', '-nodes', '-new', '-x509', '-subj', '/CN=batman.patroni',
-                                   '-keyout', context.keyfile, '-out', context.certfile], stdout=null, stderr=null)
+                                   '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', context.keyfile,
+                                   '-out', context.certfile], stdout=null, stderr=null)
             if ret != 0:
                 raise Exception
+            os.chmod(context.keyfile, stat.S_IWRITE | stat.S_IREAD)
     except Exception:
         context.keyfile = context.certfile = None
 

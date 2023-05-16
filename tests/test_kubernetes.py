@@ -5,12 +5,12 @@ import mock
 import socket
 import time
 import unittest
+import urllib3
 
 from mock import Mock, PropertyMock, mock_open, patch
 from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed,\
-        K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException,\
-        Retry, RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
-from six.moves import builtins
+    K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException,\
+    Retry, RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
 from threading import Thread
 from . import MockResponse, SleepException
 
@@ -35,6 +35,9 @@ def mock_list_namespaced_config_map(*args, **kwargs):
     metadata.update({'name': 'test-1-leader', 'labels': {Kubernetes._CITUS_LABEL: '1'},
                      'annotations': {'leader': 'p-3', 'ttl': '30s'}})
     items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
+    metadata.update({'name': 'test-2-config', 'labels': {Kubernetes._CITUS_LABEL: '2'}, 'annotations': {}})
+    items.append(k8s_client.V1ConfigMap(metadata=k8s_client.V1ObjectMeta(**metadata)))
+
     metadata = k8s_client.V1ObjectMeta(resource_version='1')
     return k8s_client.V1ConfigMapList(metadata=metadata, items=items, kind='ConfigMapList')
 
@@ -85,7 +88,7 @@ class TestK8sConfig(unittest.TestCase):
 
         with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}),\
                 patch('os.path.isfile', Mock(side_effect=[False, True, True, False, True, True, True, True])),\
-                patch.object(builtins, 'open', Mock(side_effect=[
+                patch('builtins.open', Mock(side_effect=[
                     mock_open()(), mock_open(read_data='a')(), mock_open(read_data='a')(),
                     mock_open()(), mock_open(read_data='a')(), mock_open(read_data='a')()])):
             for _ in range(0, 4):
@@ -97,7 +100,7 @@ class TestK8sConfig(unittest.TestCase):
     def test_refresh_token(self):
         with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}),\
                 patch('os.path.isfile', Mock(side_effect=[True, True, False, True, True, True])),\
-                patch.object(builtins, 'open', Mock(side_effect=[
+                patch('builtins.open', Mock(side_effect=[
                     mock_open(read_data='cert')(), mock_open(read_data='a')(),
                     mock_open()(), mock_open(read_data='b')(), mock_open(read_data='c')()])):
             k8s_config.load_incluster_config(token_refresh_interval=datetime.timedelta(milliseconds=100))
@@ -122,20 +125,20 @@ class TestK8sConfig(unittest.TestCase):
             "clusters": [{"name": "local", "cluster": {"server": "https://a:1/", "certificate-authority": "a"}}],
             "users": [{"name": "local", "user": {"username": "a", "password": "b", "client-certificate": "c"}}]
         }
-        with patch.object(builtins, 'open', mock_open(read_data=json.dumps(config))):
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))):
             k8s_config.load_kube_config()
             self.assertEqual(k8s_config.server, 'https://a:1')
             self.assertEqual(k8s_config.pool_config, {'ca_certs': 'a', 'cert_file': 'c', 'cert_reqs': 'CERT_REQUIRED',
                                                       'maxsize': 10, 'num_pools': 10})
 
         config["users"][0]["user"]["token"] = "token"
-        with patch.object(builtins, 'open', mock_open(read_data=json.dumps(config))):
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))):
             k8s_config.load_kube_config()
             self.assertEqual(k8s_config.headers.get('authorization'), 'Bearer token')
 
         config["users"][0]["user"]["client-key-data"] = base64.b64encode(b'foobar').decode('utf-8')
         config["clusters"][0]["cluster"]["certificate-authority-data"] = base64.b64encode(b'foobar').decode('utf-8')
-        with patch.object(builtins, 'open', mock_open(read_data=json.dumps(config))),\
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))),\
                 patch('os.write', Mock()), patch('os.close', Mock()),\
                 patch('os.remove') as mock_remove,\
                 patch('atexit.register') as mock_atexit,\
@@ -317,6 +320,17 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
     def test_set_history_value(self):
         self.k.set_history_value('{}')
 
+    @patch('patroni.dcs.kubernetes.logger.warning')
+    def test_reload_config(self, mock_warning):
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': '401, 403 '})
+        self.assertEqual(self.k._api._retriable_http_codes, self.k._api._DEFAULT_RETRIABLE_HTTP_CODES | set([401, 403]))
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': 402})
+        self.assertEqual(self.k._api._retriable_http_codes, self.k._api._DEFAULT_RETRIABLE_HTTP_CODES | set([402]))
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': [405, 406]})
+        self.assertEqual(self.k._api._retriable_http_codes, self.k._api._DEFAULT_RETRIABLE_HTTP_CODES | set([405, 406]))
+        self.k.reload_config({'loop_wait': 10, 'ttl': 30, 'retry_timeout': 10, 'retriable_http_codes': True})
+        mock_warning.assert_called_once()
+
 
 class TestKubernetesEndpoints(BaseTestKubernetes):
 
@@ -356,11 +370,15 @@ class TestKubernetesEndpoints(BaseTestKubernetes):
         mock_read.side_effect = Exception
         self.assertFalse(self.k.update_leader('123'))
 
-    @patch.object(k8s_client.CoreV1Api, 'create_namespaced_endpoints',
+    @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints',
                   Mock(side_effect=[k8s_client.rest.ApiException(500, ''),
                                     k8s_client.rest.ApiException(502, '')]), create=True)
     def test_delete_sync_state(self):
-        self.assertFalse(self.k.delete_sync_state())
+        self.assertFalse(self.k.delete_sync_state(1))
+
+    @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints', mock_namespaced_kind, create=True)
+    def test_write_sync_state(self):
+        self.assertIsNotNone(self.k.write_sync_state('a', ['b'], 1))
 
     @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_pod', mock_namespaced_kind, create=True)
     @patch.object(k8s_client.CoreV1Api, 'create_namespaced_endpoints', mock_namespaced_kind, create=True)
@@ -393,13 +411,18 @@ class TestKubernetesEndpoints(BaseTestKubernetes):
         self.assertEqual(('create_config_service failed',), mock_logger_exception.call_args[0])
 
 
+def mock_watch(*args):
+    return urllib3.HTTPResponse()
+
+
 class TestCacheBuilder(BaseTestKubernetes):
 
     @patch.object(k8s_client.CoreV1Api, 'list_namespaced_config_map', mock_list_namespaced_config_map, create=True)
-    @patch('patroni.dcs.kubernetes.ObjectCache._watch')
-    def test__build_cache(self, mock_response):
+    @patch('patroni.dcs.kubernetes.ObjectCache._watch', mock_watch)
+    @patch.object(urllib3.HTTPResponse, 'read_chunked')
+    def test__build_cache(self, mock_read_chunked):
         self.k._citus_group = '0'
-        mock_response.return_value.read_chunked.return_value = [json.dumps(
+        mock_read_chunked.return_value = [json.dumps(
             {'type': 'MODIFIED', 'object': {'metadata': {
                 'name': self.k.config_path, 'resourceVersion': '2', 'annotations': {self.k._CONFIG: 'foo'}}}}
         ).encode('utf-8'), ('\n' + json.dumps(
@@ -425,12 +448,13 @@ class TestCacheBuilder(BaseTestKubernetes):
         self.assertRaises(AttributeError, self.k._kinds._do_watch, '1')
 
     @patch.object(k8s_client.CoreV1Api, 'list_namespaced_config_map', mock_list_namespaced_config_map, create=True)
-    @patch('patroni.dcs.kubernetes.ObjectCache._watch')
-    def test_kill_stream(self, mock_watch):
+    @patch('patroni.dcs.kubernetes.ObjectCache._watch', mock_watch)
+    @patch.object(urllib3.HTTPResponse, 'read_chunked', Mock(return_value=[]))
+    def test_kill_stream(self):
         self.k._kinds.kill_stream()
-        mock_watch.return_value.read_chunked.return_value = []
-        mock_watch.return_value.connection.sock.close.side_effect = Exception
-        self.k._kinds._do_watch('1')
-        self.k._kinds.kill_stream()
-        type(mock_watch.return_value).connection = PropertyMock(side_effect=Exception)
-        self.k._kinds.kill_stream()
+        with patch.object(urllib3.HTTPResponse, 'connection') as mock_connection:
+            mock_connection.sock.close.side_effect = Exception
+            self.k._kinds._do_watch('1')
+            self.k._kinds.kill_stream()
+        with patch.object(urllib3.HTTPResponse, 'connection', PropertyMock(side_effect=Exception)):
+            self.k._kinds.kill_stream()

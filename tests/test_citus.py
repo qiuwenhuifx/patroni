@@ -16,7 +16,7 @@ class TestCitus(BaseTestPostgresql):
         self.cluster = get_cluster_initialized_with_leader()
         self.cluster.workers[1] = self.cluster
 
-    @patch('time.time', Mock(side_effect=[100, 130, 160, 190, 220, 250, 280]))
+    @patch('time.time', Mock(side_effect=[100, 130, 160, 190, 220, 250, 280, 310]))
     @patch('patroni.postgresql.citus.logger.exception', Mock(side_effect=SleepException))
     @patch('patroni.postgresql.citus.logger.warning')
     @patch('patroni.postgresql.citus.PgDistNode.wait', Mock())
@@ -136,8 +136,8 @@ class TestCitus(BaseTestPostgresql):
         self.assertEqual(parameters['shared_preload_libraries'], 'citus,foo,bar')
         self.assertEqual(parameters['wal_level'], 'logical')
 
-    @patch.object(CitusHandler, 'is_enabled', Mock(return_value=False))
     def test_bootstrap(self):
+        self.c._config = None
         self.c.bootstrap()
 
     def test_ignore_replication_slot(self):

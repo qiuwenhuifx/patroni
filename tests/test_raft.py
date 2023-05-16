@@ -5,7 +5,7 @@ import time
 
 from mock import Mock, PropertyMock, patch
 from patroni.dcs.raft import Cluster, DynMemberSyncObj, KVStoreTTL,\
-        Raft, RaftError, SyncObjUtility, TCPTransport, _TCPTransport
+    Raft, RaftError, SyncObjUtility, TCPTransport, _TCPTransport
 from pysyncobj import SyncObjConf, FAIL_REASON
 
 
@@ -138,6 +138,7 @@ class TestRaft(unittest.TestCase):
         self.assertTrue(raft.cancel_initialization())
         self.assertTrue(raft.set_config_value('{}'))
         self.assertTrue(raft.write_sync_state('foo', 'bar'))
+        self.assertFalse(raft.write_sync_state('foo', 'bar', 1))
         raft._citus_group = '1'
         self.assertTrue(raft.manual_failover('foo', 'bar'))
         raft._citus_group = '0'
