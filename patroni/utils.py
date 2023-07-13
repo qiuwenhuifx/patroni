@@ -326,6 +326,21 @@ def parse_int(value: Any, base_unit: Optional[str] = None) -> Optional[int]:
         >>> parse_int('1TB', 'GB') is None
         True
 
+        >>> parse_int(50, None) == 50
+        True
+
+        >>> parse_int("51", None) == 51
+        True
+
+        >>> parse_int("nonsense", None) == None
+        True
+
+        >>> parse_int("nonsense", "kB") == None
+        True
+
+        >>> parse_int("nonsense") == None
+        True
+
         >>> parse_int(0) == 0
         True
 
@@ -530,6 +545,21 @@ class Retry(object):
     def stoptime(self) -> float:
         """Get the current stop time."""
         return self._cur_stoptime or 0
+
+    def ensure_deadline(self, timeout: float, raise_ex: Optional[Exception] = None) -> bool:
+        """Calculates, sets, and checks the remaining deadline time.
+
+        :param timeout: if the *deadline* is smaller than the provided *timeout* value raise *raise_ex* exception
+        :param raise_ex: the exception object that will be raised if the *deadline* is smaller than provided *timeout*
+        :returns: `False` if *deadline* is smaller than a provided *timeout* and *raise_ex* isn't set. Otherwise `True`
+        :raises Exception: if calculated deadline is smaller than provided *timeout*
+        """
+        self.deadline = self.stoptime - time.time()
+        if self.deadline < timeout:
+            if raise_ex:
+                raise raise_ex
+            return False
+        return True
 
     def __call__(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """Call a function *func* with arguments ``*args`` and ``*kwargs`` in a loop.
@@ -743,7 +773,8 @@ def cluster_as_json(cluster: 'Cluster', global_config: Optional['GlobalConfig'] 
         else:
             role = 'replica'
 
-        member = {'name': m.name, 'role': role, 'state': m.data.get('state', ''), 'api_url': m.api_url}
+        state = (m.data.get('replication_state', '') if role != 'leader' else '') or m.data.get('state', '')
+        member = {'name': m.name, 'role': role, 'state': state, 'api_url': m.api_url}
         conn_kwargs = m.conn_kwargs()
         if conn_kwargs.get('host'):
             member['host'] = conn_kwargs['host']

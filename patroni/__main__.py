@@ -1,11 +1,13 @@
 import logging
 import os
 import signal
+import sys
 import time
 
+from argparse import Namespace
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from patroni.daemon import AbstractPatroniDaemon, abstract_main
+from patroni.daemon import AbstractPatroniDaemon, abstract_main, get_base_arg_parser
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import Config
@@ -28,12 +30,15 @@ class Patroni(AbstractPatroniDaemon):
 
         self.version = __version__
         self.dcs = get_dcs(self.config)
+        self.request = PatroniRequest(self.config, True)
+
+        self.ensure_unique_name()
+
         self.watchdog = Watchdog(self.config)
         self.load_dynamic_configuration()
 
         self.postgresql = Postgresql(self.config['postgresql'])
         self.api = RestApiServer(self, self.config['restapi'])
-        self.request = PatroniRequest(self.config, True)
         self.ha = Ha(self)
 
         self.tags = self.get_tags()
@@ -57,6 +62,23 @@ class Patroni(AbstractPatroniDaemon):
             except DCSError:
                 logger.warning('Can not get cluster from dcs')
                 time.sleep(5)
+
+    def ensure_unique_name(self) -> None:
+        """A helper method to prevent splitbrain from operator naming error."""
+        from patroni.dcs import Member
+
+        cluster = self.dcs.get_cluster()
+        if not cluster:
+            return
+        member = cluster.get_member(self.config['name'], False)
+        if not isinstance(member, Member):
+            return
+        try:
+            _ = self.request(member, endpoint="/liveness")
+            logger.fatal("Can't start; there is already a node named '%s' running", self.config['name'])
+            sys.exit(1)
+        except Exception:
+            return
 
     def get_tags(self) -> Dict[str, Any]:
         return {tag: value for tag, value in self.config.get('tags', {}).items()
@@ -133,21 +155,40 @@ class Patroni(AbstractPatroniDaemon):
             logger.exception('Exception during Ha.shutdown')
 
 
-def patroni_main() -> None:
+def patroni_main(configfile: str) -> None:
     from multiprocessing import freeze_support
-    from patroni.validator import schema
 
     freeze_support()
-    abstract_main(Patroni, schema)
+    abstract_main(Patroni, configfile)
+
+
+def process_arguments() -> Namespace:
+    parser = get_base_arg_parser()
+    parser.add_argument('--validate-config', action='store_true', help='Run config validator and exit')
+    args = parser.parse_args()
+
+    if args.validate_config:
+        from patroni.validator import schema
+        from patroni.config import Config, ConfigParseError
+
+        try:
+            Config(args.configfile, validator=schema)
+            sys.exit()
+        except ConfigParseError as e:
+            sys.exit(e.value)
+
+    return args
 
 
 def main() -> None:
     from patroni import check_psycopg
 
+    args = process_arguments()
+
     check_psycopg()
 
     if os.getpid() != 1:
-        return patroni_main()
+        return patroni_main(args.configfile)
 
     # Patroni started with PID=1, it looks like we are in the container
     from types import FrameType
@@ -180,7 +221,7 @@ def main() -> None:
     signal.signal(signal.SIGTERM, passtochild)
 
     import multiprocessing
-    patroni = multiprocessing.Process(target=patroni_main)
+    patroni = multiprocessing.Process(target=patroni_main, args=(args.configfile,))
     patroni.start()
     pid = patroni.pid
     patroni.join()

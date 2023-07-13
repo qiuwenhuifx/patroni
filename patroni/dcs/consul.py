@@ -67,7 +67,7 @@ class HTTPClient(object):
         if ca_cert:
             kwargs['ca_certs'] = ca_cert
         kwargs['cert_reqs'] = ssl.CERT_REQUIRED if verify or ca_cert else ssl.CERT_NONE
-        self.http = urllib3.PoolManager(num_pools=10, maxsize=10, **kwargs)
+        self.http = urllib3.PoolManager(num_pools=10, maxsize=10, headers={}, **kwargs)
         self._ttl = 30
 
     def set_read_timeout(self, timeout: float) -> None:
@@ -400,8 +400,12 @@ class Consul(AbstractDCS):
 
         return Cluster(initialize, config, leader, last_lsn, members, failover, sync, history, slots, failsafe)
 
+    @property
+    def _consistency(self) -> str:
+        return 'consistent' if self._ctl else self._client.consistency
+
     def _cluster_loader(self, path: str) -> Cluster:
-        _, results = self.retry(self._client.kv.get, path, recurse=True)
+        _, results = self.retry(self._client.kv.get, path, recurse=True, consistency=self._consistency)
         if results is None:
             raise NotFound
         nodes = {}
@@ -412,7 +416,7 @@ class Consul(AbstractDCS):
         return self._cluster_from_nodes(nodes)
 
     def _citus_cluster_loader(self, path: str) -> Dict[int, Cluster]:
-        _, results = self.retry(self._client.kv.get, path, recurse=True)
+        _, results = self.retry(self._client.kv.get, path, recurse=True, consistency=self._consistency)
         clusters: Dict[int, Dict[str, Cluster]] = defaultdict(dict)
         for node in results or []:
             key = node['Key'][len(path):].split('/', 1)
@@ -549,13 +553,11 @@ class Consul(AbstractDCS):
         except InvalidSession:
             logger.error('Our session disappeared from Consul. Will try to get a new one and retry attempt')
             self._session = None
-            retry.deadline = retry.stoptime - time.time()
+            retry.ensure_deadline(0)
 
             retry(self._do_refresh_session)
 
-            retry.deadline = retry.stoptime - time.time()
-            if retry.deadline < 1:
-                raise ConsulError('_do_attempt_to_acquire_leader timeout')
+            retry.ensure_deadline(1, ConsulError('_do_attempt_to_acquire_leader timeout'))
 
             return retry(self._client.kv.put, self.leader_path, self._name, acquire=self._session)
 
@@ -564,9 +566,7 @@ class Consul(AbstractDCS):
         retry = self._retry.copy()
         self._run_and_handle_exceptions(self._do_refresh_session, retry=retry)
 
-        retry.deadline = retry.stoptime - time.time()
-        if retry.deadline < 1:
-            raise ConsulError('attempt_to_acquire_leader timeout')
+        retry.ensure_deadline(1, ConsulError('attempt_to_acquire_leader timeout'))
 
         ret = self._run_and_handle_exceptions(self._do_attempt_to_acquire_leader, retry, retry=None)
         if not ret:
@@ -608,28 +608,20 @@ class Consul(AbstractDCS):
             raise ReturnFalseException
 
     @catch_return_false_exception
-    def _update_leader(self) -> bool:
+    def _update_leader(self, leader: Leader) -> bool:
         retry = self._retry.copy()
 
         self._run_and_handle_exceptions(self._do_refresh_session, True, retry=retry)
 
-        if self._session:
-            cluster = self.cluster
-            leader_session = cluster and isinstance(cluster.leader, Leader) and cluster.leader.session
-            if leader_session != self._session:
-                retry.deadline = retry.stoptime - time.time()
-                if retry.deadline < 1:
-                    raise ConsulError('update_leader timeout')
-                logger.warning('Recreating the leader key due to session mismatch')
-                if cluster and cluster.leader:
-                    self._run_and_handle_exceptions(self._client.kv.delete, self.leader_path,
-                                                    cas=cluster.leader.version)
+        if self._session and leader.session != self._session:
+            retry.ensure_deadline(1, ConsulError('update_leader timeout'))
 
-                retry.deadline = retry.stoptime - time.time()
-                if retry.deadline < 0.5:
-                    raise ConsulError('update_leader timeout')
-                self._run_and_handle_exceptions(self._client.kv.put, self.leader_path,
-                                                self._name, acquire=self._session)
+            logger.warning('Recreating the leader key due to session mismatch')
+            self._run_and_handle_exceptions(self._client.kv.delete, self.leader_path, cas=leader.version)
+
+            retry.ensure_deadline(0.5, ConsulError('update_leader timeout'))
+
+            self._run_and_handle_exceptions(self._client.kv.put, self.leader_path, self._name, acquire=self._session)
 
         return bool(self._session)
 
@@ -663,8 +655,7 @@ class Consul(AbstractDCS):
         retry = self._retry.copy()
         ret = retry(self._client.kv.put, self.sync_path, value, cas=version)
         if ret:  # We have no other choise, only read after write :(
-            retry.deadline = retry.stoptime - time.time()
-            if retry.deadline < 0.5:
+            if not retry.ensure_deadline(0.5):
                 return False
             _, ret = self.retry(self._client.kv.get, self.sync_path)
             if ret and (ret.get('Value') or b'').decode('utf-8') == value:

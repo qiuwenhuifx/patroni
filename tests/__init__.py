@@ -3,7 +3,7 @@ import os
 import shutil
 import unittest
 
-from mock import Mock, patch
+from mock import Mock, PropertyMock, patch
 
 import urllib3
 
@@ -17,6 +17,15 @@ from patroni.utils import RetryFailedError, tzutc
 
 class SleepException(Exception):
     pass
+
+
+mock_available_gucs = PropertyMock(return_value={
+    'cluster_name', 'constraint_exclusion', 'force_parallel_mode', 'hot_standby', 'listen_addresses', 'max_connections',
+    'max_locks_per_transaction', 'max_prepared_transactions', 'max_replication_slots', 'max_stack_depth',
+    'max_wal_senders', 'max_worker_processes', 'port', 'search_path', 'shared_preload_libraries',
+    'stats_temp_directory', 'synchronous_standby_names', 'track_commit_timestamp', 'unix_socket_directories',
+    'vacuum_cost_delay', 'vacuum_cost_limit', 'wal_keep_size', 'wal_level', 'wal_log_hints', 'zero_damaged_pages',
+})
 
 
 class MockResponse(object):
@@ -99,7 +108,7 @@ class MockCursor(object):
         elif sql.startswith('WITH slots AS (SELECT slot_name, active'):
             self.results = [(False, True)] if self.rowcount == 1 else [None]
         elif sql.startswith('SELECT CASE WHEN pg_catalog.pg_is_in_recovery()'):
-            self.results = [(1, 2, 1, 0, False, 1, 1, None, None,
+            self.results = [(1, 2, 1, 0, False, 1, 1, None, None, 'streaming', '',
                              [{"slot_name": "ls", "confirmed_flush_lsn": 12345}],
                              'on', 'n1', None)]
         elif sql.startswith('SELECT pg_catalog.pg_is_in_recovery()'):
@@ -108,7 +117,7 @@ class MockCursor(object):
             replication_info = '[{"application_name":"walreceiver","client_addr":"1.2.3.4",' +\
                                '"state":"streaming","sync_state":"async","sync_priority":0}]'
             now = datetime.datetime.now(tzutc)
-            self.results = [(now, 0, '', 0, '', False, now, replication_info)]
+            self.results = [(now, 0, '', 0, '', False, now, 'streaming', None, replication_info)]
         elif sql.startswith('SELECT name, setting'):
             self.results = [('wal_segment_size', '2048', '8kB', 'integer', 'internal'),
                             ('wal_block_size', '8192', None, 'integer', 'internal'),
