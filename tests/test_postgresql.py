@@ -310,6 +310,17 @@ class TestPostgresql(BaseTestPostgresql):
         self.p.config.write_postgresql_conf()
         self.assertEqual(self.p.config.check_recovery_conf(None), (False, False))
         self.assertEqual(self.p.config.check_recovery_conf(None), (False, False))
+
+        # Config files changed, but can't connect to postgres
+        mock_get_pg_settings.side_effect = PostgresConnectionException('')
+        with patch('patroni.postgresql.config.mtime', mock_mtime):
+            self.assertEqual(self.p.config.check_recovery_conf(None), (True, True))
+
+        # Config files didn't change, but postgres crashed or in crash recovery
+        with patch.object(MockPostmaster, 'create_time', Mock(return_value=1234568), create=True):
+            self.assertEqual(self.p.config.check_recovery_conf(None), (False, False))
+
+        # Any other exception raised when executing the query
         mock_get_pg_settings.side_effect = Exception
         with patch('patroni.postgresql.config.mtime', mock_mtime):
             self.assertEqual(self.p.config.check_recovery_conf(None), (True, True))
@@ -333,7 +344,7 @@ class TestPostgresql(BaseTestPostgresql):
 
         mock_read_auto = mock_open(read_data=read_data)
         mock_read_auto.return_value.__iter__ = lambda o: iter(o.readline, '')
-        with patch('builtins.open', Mock(side_effect=[mock_open()(), mock_read_auto(), IOError])),\
+        with patch('builtins.open', Mock(side_effect=[mock_open()(), mock_read_auto(), IOError])), \
                 patch('os.chmod', Mock()):
             self.p.config.write_postgresql_conf()
 
@@ -346,8 +357,7 @@ class TestPostgresql(BaseTestPostgresql):
     @patch.object(Postgresql, 'start', Mock())
     def test_follow(self):
         self.p.call_nowait(CallbackAction.ON_START)
-        m = RemoteMember.from_name_and_data('1', {'restore_command': '2', 'primary_slot_name': 'foo',
-                                                  'conn_kwargs': {'host': 'bar'}})
+        m = RemoteMember('1', {'restore_command': '2', 'primary_slot_name': 'foo', 'conn_kwargs': {'host': 'bar'}})
         self.p.follow(m)
         with patch.object(Postgresql, 'ensure_major_version_is_known', Mock(return_value=False)):
             self.assertIsNone(self.p.follow(m))
@@ -364,11 +374,11 @@ class TestPostgresql(BaseTestPostgresql):
         self.assertRaises(psycopg.ProgrammingError, self.p.query, 'blabla')
 
     @patch.object(Postgresql, 'pg_isready', Mock(return_value=STATE_REJECT))
-    def test_is_leader(self):
-        self.assertTrue(self.p.is_leader())
+    def test_is_primary(self):
+        self.assertTrue(self.p.is_primary())
         self.p.reset_cluster_info_state(None)
         with patch.object(Postgresql, '_query', Mock(side_effect=RetryFailedError(''))):
-            self.assertFalse(self.p.is_leader())
+            self.assertFalse(self.p.is_primary())
 
     @patch.object(Postgresql, 'controldata', Mock(return_value={'Database cluster state': 'shut down',
                                                                 'Latest checkpoint location': '0/1ADBC18',
@@ -462,7 +472,7 @@ class TestPostgresql(BaseTestPostgresql):
         self.assertIsNone(self.p.call_nowait(CallbackAction.ON_START))
 
     @patch.object(Postgresql, 'is_running', Mock(return_value=MockPostmaster()))
-    def test_is_leader_exception(self):
+    def test_is_primary_exception(self):
         self.p.start()
         self.p.query = Mock(side_effect=psycopg.OperationalError("not supported"))
         self.assertTrue(self.p.stop())
@@ -496,8 +506,8 @@ class TestPostgresql(BaseTestPostgresql):
             self.p.remove_data_directory()
         with patch('os.path.isfile', Mock(return_value=True)):
             self.p.remove_data_directory()
-        with patch('os.path.islink', Mock(side_effect=[False, False, True, True])),\
-                patch('os.listdir', Mock(return_value=['12345'])),\
+        with patch('os.path.islink', Mock(side_effect=[False, False, True, True])), \
+                patch('os.listdir', Mock(return_value=['12345'])), \
                 patch('os.path.realpath', Mock(side_effect=['../foo', '../foo_tsp'])):
             self.p.remove_data_directory()
 
@@ -523,8 +533,9 @@ class TestPostgresql(BaseTestPostgresql):
     def test_save_configuration_files(self):
         self.p.config.save_configuration_files()
 
-    @patch('os.path.isfile', Mock(side_effect=[False, True]))
-    @patch('shutil.copy', Mock(side_effect=IOError))
+    @patch('os.path.isfile', Mock(side_effect=[False, True, False, True]))
+    @patch('shutil.copy', Mock(side_effect=[None, IOError]))
+    @patch('os.chmod', Mock())
     def test_restore_configuration_files(self):
         self.p.config.restore_configuration_files()
 
@@ -545,9 +556,7 @@ class TestPostgresql(BaseTestPostgresql):
 
     @patch('time.sleep', Mock())
     @patch.object(Postgresql, 'is_running', Mock(return_value=True))
-    @patch.object(MockCursor, 'fetchone')
-    def test_reload_config(self, mock_fetchone):
-        mock_fetchone.return_value = (1,)
+    def test_reload_config(self):
         parameters = self._PARAMETERS.copy()
         parameters.pop('f.oo')
         parameters['wal_buffers'] = '512'
@@ -555,9 +564,14 @@ class TestPostgresql(BaseTestPostgresql):
                   'authentication': {},
                   'retry_timeout': 10, 'listen': '*', 'krbsrvname': 'postgres', 'parameters': parameters}
         self.p.reload_config(config)
-        mock_fetchone.side_effect = Exception
         parameters['b.ar'] = 'bar'
-        self.p.reload_config(config)
+        with patch.object(MockCursor, 'fetchall',
+                          Mock(side_effect=[[('wal_block_size', '8191', None, 'integer', 'internal'),
+                                             ('wal_segment_size', '2048', '8kB', 'integer', 'internal'),
+                                             ('shared_buffers', '16384', '8kB', 'integer', 'postmaster'),
+                                             ('wal_buffers', '-1', '8kB', 'integer', 'postmaster'),
+                                             ('port', '5433', None, 'integer', 'postmaster')], Exception])):
+            self.p.reload_config(config)
         parameters['autovacuum'] = 'on'
         self.p.reload_config(config)
         parameters['autovacuum'] = 'off'
@@ -574,7 +588,10 @@ class TestPostgresql(BaseTestPostgresql):
         self.assertEqual(self.p.config.local_replication_address, {'host': '/tmp', 'port': '5432'})
         self.p.config._server_parameters.pop('unix_socket_directories')
         self.p.config.resolve_connection_addresses()
-        self.assertEqual(self.p.config._local_address, {'port': '5432'})
+        self.assertEqual(self.p.connection_pool.conn_kwargs, {'connect_timeout': 3, 'dbname': 'postgres',
+                                                              'fallback_application_name': 'Patroni',
+                                                              'options': '-c statement_timeout=2000',
+                                                              'password': 'test', 'port': '5432', 'user': 'foo'})
 
     @patch.object(Postgresql, '_version_file_exists', Mock(return_value=True))
     def test_get_major_version(self):
@@ -585,7 +602,7 @@ class TestPostgresql(BaseTestPostgresql):
 
     def test_postmaster_start_time(self):
         now = datetime.datetime.now()
-        with patch.object(MockCursor, "fetchone", Mock(return_value=(now, True, '', '', '', '', False))):
+        with patch.object(MockCursor, "fetchall", Mock(return_value=[(now, True, '', '', '', '', False)])):
             self.assertEqual(self.p.postmaster_start_time(), now.isoformat(sep=' '))
             t = Thread(target=self.p.postmaster_start_time)
             t.start()
@@ -955,3 +972,10 @@ class TestPostgresql2(BaseTestPostgresql):
         gucs = self.p.available_gucs
         self.assertIsInstance(gucs, CaseInsensitiveSet)
         self.assertEqual(gucs, mock_available_gucs.return_value)
+
+    def test_cluster_info_query(self):
+        self.assertIn('diff(pg_catalog.pg_current_wal_flush_lsn(', self.p.cluster_info_query)
+        self.p._major_version = 90600
+        self.assertIn('diff(pg_catalog.pg_current_xlog_flush_location(', self.p.cluster_info_query)
+        self.p._major_version = 90500
+        self.assertIn('diff(pg_catalog.pg_current_xlog_location(', self.p.cluster_info_query)

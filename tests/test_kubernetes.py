@@ -8,8 +8,8 @@ import unittest
 import urllib3
 
 from mock import Mock, PropertyMock, mock_open, patch
-from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed,\
-    K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException,\
+from patroni.dcs.kubernetes import Cluster, k8s_client, k8s_config, K8sConfig, K8sConnectionFailed, \
+    K8sException, K8sObject, Kubernetes, KubernetesError, KubernetesRetriableException, \
     Retry, RetryFailedError, SERVICE_HOST_ENV_NAME, SERVICE_PORT_ENV_NAME
 from threading import Thread
 from . import MockResponse, SleepException
@@ -86,8 +86,8 @@ class TestK8sConfig(unittest.TestCase):
             with patch('os.environ', env):
                 self.assertRaises(k8s_config.ConfigException, k8s_config.load_incluster_config)
 
-        with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}),\
-                patch('os.path.isfile', Mock(side_effect=[False, True, True, False, True, True, True, True])),\
+        with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}), \
+                patch('os.path.isfile', Mock(side_effect=[False, True, True, False, True, True, True, True])), \
                 patch('builtins.open', Mock(side_effect=[
                     mock_open()(), mock_open(read_data='a')(), mock_open(read_data='a')(),
                     mock_open()(), mock_open(read_data='a')(), mock_open(read_data='a')()])):
@@ -98,8 +98,8 @@ class TestK8sConfig(unittest.TestCase):
             self.assertEqual(k8s_config.headers.get('authorization'), 'Bearer a')
 
     def test_refresh_token(self):
-        with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}),\
-                patch('os.path.isfile', Mock(side_effect=[True, True, False, True, True, True])),\
+        with patch('os.environ', {SERVICE_HOST_ENV_NAME: 'a', SERVICE_PORT_ENV_NAME: '1'}), \
+                patch('os.path.isfile', Mock(side_effect=[True, True, False, True, True, True])), \
                 patch('builtins.open', Mock(side_effect=[
                     mock_open(read_data='cert')(), mock_open(read_data='a')(),
                     mock_open()(), mock_open(read_data='b')(), mock_open(read_data='c')()])):
@@ -138,10 +138,10 @@ class TestK8sConfig(unittest.TestCase):
 
         config["users"][0]["user"]["client-key-data"] = base64.b64encode(b'foobar').decode('utf-8')
         config["clusters"][0]["cluster"]["certificate-authority-data"] = base64.b64encode(b'foobar').decode('utf-8')
-        with patch('builtins.open', mock_open(read_data=json.dumps(config))),\
-                patch('os.write', Mock()), patch('os.close', Mock()),\
-                patch('os.remove') as mock_remove,\
-                patch('atexit.register') as mock_atexit,\
+        with patch('builtins.open', mock_open(read_data=json.dumps(config))), \
+                patch('os.write', Mock()), patch('os.close', Mock()), \
+                patch('os.remove') as mock_remove, \
+                patch('atexit.register') as mock_atexit, \
                 patch('tempfile.mkstemp') as mock_mkstemp:
             mock_mkstemp.side_effect = [(3, '1.tmp'), (4, '2.tmp')]
             k8s_config.load_kube_config()
@@ -298,11 +298,35 @@ class TestKubernetesConfigMaps(BaseTestKubernetes):
         self.k.touch_member({'state': 'running', 'role': 'replica'})
         self.k.touch_member({'state': 'stopped', 'role': 'primary'})
 
+        self.k._role_label = 'isMaster'
+        self.k._leader_label_value = 'true'
+        self.k._follower_label_value = 'false'
+        self.k._standby_leader_label_value = 'false'
+        self.k._tmp_role_label = 'tmp_role'
+
+        self.k.touch_member({'state': 'running', 'role': 'replica'})
+        mock_patch_namespaced_pod.assert_called()
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['isMaster'], 'false')
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'replica')
+        mock_patch_namespaced_pod.rest_mock()
+
+        self.k._name = 'p-0'
+        self.k.touch_member({'role': 'standby_leader'})
+        mock_patch_namespaced_pod.assert_called()
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['isMaster'], 'false')
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'master')
+        mock_patch_namespaced_pod.rest_mock()
+
+        self.k.touch_member({'role': 'primary'})
+        mock_patch_namespaced_pod.assert_called()
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['isMaster'], 'true')
+        self.assertEqual(mock_patch_namespaced_pod.call_args[0][2].metadata.labels['tmp_role'], 'master')
+
     def test_initialize(self):
         self.k.initialize()
 
     def test_delete_leader(self):
-        self.k.delete_leader(1)
+        self.k.delete_leader(self.k.get_cluster().leader, 1)
 
     def test_cancel_initialization(self):
         self.k.cancel_initialization()
@@ -411,6 +435,10 @@ class TestKubernetesEndpoints(BaseTestKubernetes):
         self.k.touch_member({'state': 'running', 'role': 'replica'})
         mock_logger_exception.assert_called_once()
         self.assertEqual(('create_config_service failed',), mock_logger_exception.call_args[0])
+
+    @patch.object(k8s_client.CoreV1Api, 'patch_namespaced_endpoints', mock_namespaced_kind, create=True)
+    def test_write_leader_optime(self):
+        self.k.write_leader_optime(12345)
 
 
 def mock_watch(*args):

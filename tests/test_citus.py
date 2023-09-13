@@ -13,7 +13,7 @@ class TestCitus(BaseTestPostgresql):
     def setUp(self):
         super(TestCitus, self).setUp()
         self.c = self.p.citus_handler
-        self.c.set_conn_kwargs({'host': 'localhost', 'dbname': 'postgres'})
+        self.p.connection_pool.conn_kwargs = {'host': 'localhost', 'dbname': 'postgres'}
         self.cluster = get_cluster_initialized_with_leader()
         self.cluster.workers[1] = self.cluster
 
@@ -52,7 +52,7 @@ class TestCitus(BaseTestPostgresql):
                                                'leader': 'leader', 'timeout': 30, 'cooldown': 10})
 
     def test_add_task(self):
-        with patch('patroni.postgresql.citus.logger.error') as mock_logger,\
+        with patch('patroni.postgresql.citus.logger.error') as mock_logger, \
                 patch('patroni.postgresql.citus.urlparse', Mock(side_effect=Exception)):
             self.c.add_task('', 1, None)
             mock_logger.assert_called_once()
@@ -107,7 +107,7 @@ class TestCitus(BaseTestPostgresql):
         self.c.process_tasks()
 
         self.c.add_task('after_promote', 0, 'postgres://host3:5432/postgres')
-        with patch('patroni.postgresql.citus.logger.error') as mock_logger,\
+        with patch('patroni.postgresql.citus.logger.error') as mock_logger, \
                 patch.object(CitusHandler, 'query', Mock(side_effect=Exception)):
             self.c.process_tasks()
             mock_logger.assert_called_once()

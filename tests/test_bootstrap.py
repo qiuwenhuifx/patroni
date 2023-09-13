@@ -155,9 +155,9 @@ class TestBootstrap(BaseTestPostgresql):
 
         config = {'users': {'replicator': {'password': 'rep-pass', 'options': ['replication']}}}
 
-        with patch.object(Postgresql, 'is_running', Mock(return_value=False)),\
-                patch.object(Postgresql, 'get_major_version', Mock(return_value=140000)),\
-                patch('multiprocessing.Process', Mock(side_effect=Exception)),\
+        with patch.object(Postgresql, 'is_running', Mock(return_value=False)), \
+                patch.object(Postgresql, 'get_major_version', Mock(return_value=140000)), \
+                patch('multiprocessing.Process', Mock(side_effect=Exception)), \
                 patch('multiprocessing.get_context', Mock(side_effect=Exception), create=True):
             self.assertRaises(Exception, self.b.bootstrap, config)
         with open(os.path.join(self.p.data_dir, 'pg_hba.conf')) as f:
@@ -185,12 +185,12 @@ class TestBootstrap(BaseTestPostgresql):
         self.assertFalse(self.b.bootstrap(config))
 
         mock_cancellable_subprocess_call.return_value = 0
-        with patch('multiprocessing.Process', Mock(side_effect=Exception("42"))),\
-                patch('multiprocessing.get_context', Mock(side_effect=Exception("42")), create=True),\
-                patch('os.path.isfile', Mock(return_value=True)),\
-                patch('os.unlink', Mock()),\
-                patch.object(ConfigHandler, 'save_configuration_files', Mock()),\
-                patch.object(ConfigHandler, 'restore_configuration_files', Mock()),\
+        with patch('multiprocessing.Process', Mock(side_effect=Exception("42"))), \
+                patch('multiprocessing.get_context', Mock(side_effect=Exception("42")), create=True), \
+                patch('os.path.isfile', Mock(return_value=True)), \
+                patch('os.unlink', Mock()), \
+                patch.object(ConfigHandler, 'save_configuration_files', Mock()), \
+                patch.object(ConfigHandler, 'restore_configuration_files', Mock()), \
                 patch.object(ConfigHandler, 'write_recovery_conf', Mock()):
             with self.assertRaises(Exception) as e:
                 self.b.bootstrap(config)
@@ -250,7 +250,7 @@ class TestBootstrap(BaseTestPostgresql):
         self.assertFalse(self.b.call_post_bootstrap({'post_init': '/bin/false'}))
 
         mock_cancellable_subprocess_call.return_value = 0
-        self.p.config.superuser.pop('username')
+        self.p.connection_pool._conn_kwargs.pop('user')
         self.assertTrue(self.b.call_post_bootstrap({'post_init': '/bin/false'}))
         mock_cancellable_subprocess_call.assert_called()
         args, kwargs = mock_cancellable_subprocess_call.call_args
@@ -258,7 +258,7 @@ class TestBootstrap(BaseTestPostgresql):
         self.assertEqual(args[0], ['/bin/false', 'dbname=postgres host=127.0.0.2 port=5432'])
 
         mock_cancellable_subprocess_call.reset_mock()
-        self.p.config._local_address.pop('host')
+        self.p.connection_pool._conn_kwargs.pop('host')
         self.assertTrue(self.b.call_post_bootstrap({'post_init': '/bin/false'}))
         mock_cancellable_subprocess_call.assert_called()
         self.assertEqual(mock_cancellable_subprocess_call.call_args[0][0], ['/bin/false', 'dbname=postgres port=5432'])

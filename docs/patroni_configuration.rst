@@ -44,7 +44,6 @@ Some of the PostgreSQL parameters **must hold the same values on the primary and
 - **max_worker_processes**: 8
 - **max_prepared_transactions**: 0
 - **wal_level**: hot_standby
-- **wal_log_hints**: on
 - **track_commit_timestamp**: off
 
 For the parameters below, PostgreSQL does not require equal values among the primary and all the replicas. However, considering the possibility of a replica to become the primary at any time, it doesn't really make sense to set them differently; therefore, **Patroni restricts setting their values to the** :ref:`dynamic configuration <dynamic_configuration>`.
@@ -62,6 +61,7 @@ There are some other Postgres parameters controlled by Patroni:
 - **port** - is set either from ``postgresql.listen`` or from ``PATRONI_POSTGRESQL_LISTEN`` environment variable
 - **cluster_name** - is set either from ``scope`` or from ``PATRONI_SCOPE`` environment variable
 - **hot_standby: on**
+- **wal_log_hints: on** - for Postgres 9.4 and newer.
 
 To be on the safe side parameters from the above lists are not written into ``postgresql.conf``, but passed as a list of arguments to the ``pg_ctl start`` which gives them the highest precedence, even above `ALTER SYSTEM <https://www.postgresql.org/docs/current/static/sql-altersystem.html>`__
 
@@ -89,6 +89,42 @@ The parameters would be applied in the following order (run-time are given the h
 
 This allows configuration for all the nodes (2), configuration for a specific node using ``ALTER SYSTEM`` (3) and ensures that parameters essential to the running of Patroni are enforced (4), as well as leaves room for configuration tools that manage `postgresql.conf` directly without involving Patroni (1).
 
+
+PostgreSQL parameters that touch shared memory
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+PostgreSQL has some parameters that determine the size of the shared memory used by them:
+
+- **max_connections**
+- **max_prepared_transactions**
+- **max_locks_per_transaction**
+- **max_wal_senders**
+- **max_worker_processes**
+
+Changing these parameters require a PostgreSQL restart to take effect, and their shared memory structures cannot be smaller on the standby nodes than on the primary node.
+
+As explained before, Patroni restrict changing their values through :ref:`dynamic configuration <dynamic_configuration>`, which usually consists of:
+
+1. Applying changes through ``patronictl edit-config`` (or via REST API ``/config`` endpoint)
+2. Restarting nodes through ``patronictl restart`` (or via REST API ``/restart`` endpoint)
+
+**Note:** please keep in mind that you should perform a restart of the PostgreSQL nodes through ``patronictl restart`` command, or via REST API ``/restart`` endpoint. An attempt to restart PostgreSQL by restarting the Patroni daemon, e.g. by executing ``systemctl restart patroni``, can cause a failover to occur in the cluster, if you are restarting the primary node.
+
+However, as those settings manage shared memory, some extra care should be taken when restarting the nodes:
+
+* If you want to **increase** the value of any of those settings:
+
+   1. Restart all standbys first
+   2. Restart the primary after that
+
+* If you want to **decrease** the value of any of those settings:
+
+   1. Restart the primary first
+   2. Restart all standbys after that
+
+**Note:** if you attempt to restart all nodes in one go after **decreasing** the value of any of those settings, Patroni will ignore the change and restart the standby with the original setting value, thus requiring that you restart the standbys again later. Patroni does that to prevent the standby to enter in an infinite crash loop, because PostgreSQL quits with a `FATAL` message if you attempt to set any of those parameters to a value lower than what is visible in ``pg_controldata`` on the Standby node. In other words, we can only decrease the setting on the standby once its ``pg_controldata`` is up-to-date with the primary in regards to these changes on the primary.
+
+More information about that can be found at `PostgreSQL Administrator's Overview <https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-ADMIN>`__.
 
 Patroni configuration parameters
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

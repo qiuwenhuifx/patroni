@@ -7,7 +7,7 @@ from kazoo.handlers.threading import SequentialThreadingHandler
 from kazoo.protocol.states import KeeperState, ZnodeStat
 from kazoo.retry import RetryFailedError
 from mock import Mock, PropertyMock, patch
-from patroni.dcs.zookeeper import Cluster, Leader, PatroniKazooClient,\
+from patroni.dcs.zookeeper import Cluster, Leader, PatroniKazooClient, \
     PatroniSequentialThreadingHandler, ZooKeeper, ZooKeeperError
 
 
@@ -202,7 +202,7 @@ class TestZooKeeper(unittest.TestCase):
         mock_logger.assert_called_once()
 
     def test_delete_leader(self):
-        self.assertTrue(self.zk.delete_leader())
+        self.assertTrue(self.zk.delete_leader(self.zk.get_cluster().leader))
 
     def test_set_failover_value(self):
         self.zk.set_failover_value('')

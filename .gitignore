@@ -33,7 +33,7 @@ nosetests.xml
 coverage.xml
 htmlcov
 junit.xml
-features/output
+features/output*
 dummy
 
 # Translations
@@ -48,9 +48,12 @@ pgpass
 scm-source.json
 
 # Sphinx-generated documentation
+docs/_build/
 docs/build/
 docs/source/_static/
 docs/source/_templates/
+docs/modules/
+docs/pdf/
 
 # Pycharm IDE
 .idea/
@@ -63,3 +66,6 @@ venv*/
 
 # Default test data directory
 data/
+
+# macOS
+**/.DS_Store

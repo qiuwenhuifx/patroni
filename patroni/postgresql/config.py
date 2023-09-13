@@ -6,16 +6,18 @@ import socket
 import stat
 import time
 
+from contextlib import contextmanager
 from urllib.parse import urlparse, parse_qsl, unquote
 from types import TracebackType
-from typing import Any, Collection, Dict, List, Optional, Union, Tuple, Type, TYPE_CHECKING
+from typing import Any, Collection, Dict, Iterator, List, Optional, Union, Tuple, Type, TYPE_CHECKING
 
 from .validator import recovery_parameters, transform_postgresql_parameter_value, transform_recovery_parameter_value
 from ..collections import CaseInsensitiveDict, CaseInsensitiveSet
 from ..dcs import Leader, Member, RemoteMember, slot_name_from_member_name
-from ..exceptions import PatroniFatalException
+from ..exceptions import PatroniFatalException, PostgresConnectionException
+from ..file_perm import pg_perm
 from ..utils import compare_values, parse_bool, parse_int, split_host_port, uri, validate_directory, is_subpath
-from ..validator import IntValidator
+from ..validator import IntValidator, EnumValidator
 
 if TYPE_CHECKING:  # pragma: no cover
     from . import Postgresql
@@ -258,12 +260,12 @@ def _false_validator(value: Any) -> bool:
     return False
 
 
-def _wal_level_validator(value: Any) -> bool:
-    return str(value).lower() in ('hot_standby', 'replica', 'logical')
-
-
 def _bool_validator(value: Any) -> bool:
     return parse_bool(value) is not None
+
+
+def _bool_is_true_validator(value: Any) -> bool:
+    return parse_bool(value) is True
 
 
 class ConfigHandler(object):
@@ -286,8 +288,8 @@ class ConfigHandler(object):
         'listen_addresses': (None, _false_validator, 90100),
         'port': (None, _false_validator, 90100),
         'cluster_name': (None, _false_validator, 90500),
-        'wal_level': ('hot_standby', _wal_level_validator, 90100),
-        'hot_standby': ('on', _false_validator, 90100),
+        'wal_level': ('hot_standby', EnumValidator(('hot_standby', 'replica', 'logical')), 90100),
+        'hot_standby': ('on', _bool_is_true_validator, 90100),
         'max_connections': (100, IntValidator(min=25), 90100),
         'max_wal_senders': (10, IntValidator(min=3), 90100),
         'wal_keep_segments': (8, IntValidator(min=1), 90100),
@@ -297,7 +299,7 @@ class ConfigHandler(object):
         'track_commit_timestamp': ('off', _bool_validator, 90500),
         'max_replication_slots': (10, IntValidator(min=4), 90400),
         'max_worker_processes': (8, IntValidator(min=2), 90400),
-        'wal_log_hints': ('on', _false_validator, 90400)
+        'wal_log_hints': ('on', _bool_is_true_validator, 90400)
     })
 
     _RECOVERY_PARAMETERS = CaseInsensitiveSet(recovery_parameters.keys())
@@ -367,6 +369,30 @@ class ConfigHandler(object):
             configuration.append('pg_ident.conf')
         return configuration
 
+    def set_file_permissions(self, filename: str) -> None:
+        """Set permissions of file *filename* according to the expected permissions if it resides under PGDATA.
+
+        .. note::
+            Do nothing if the file is not under PGDATA.
+
+        :param filename: path to a file which permissions might need to be adjusted.
+        """
+        if is_subpath(self._postgresql.data_dir, filename):
+            pg_perm.set_permissions_from_data_directory(self._postgresql.data_dir)
+            os.chmod(filename, pg_perm.file_create_mode)
+
+    @contextmanager
+    def config_writer(self, filename: str) -> Iterator[ConfigWriter]:
+        """Create :class:`ConfigWriter` object and set permissions on a *filename*.
+
+        :param filename: path to a config file.
+
+        :yields: :class:`ConfigWriter` object.
+        """
+        with ConfigWriter(filename) as writer:
+            yield writer
+        self.set_file_permissions(filename)
+
     def save_configuration_files(self, check_custom_bootstrap: bool = False) -> bool:
         """
             copy postgresql.conf to postgresql.conf.backup to be able to retrieve configuration files
@@ -380,6 +406,7 @@ class ConfigHandler(object):
                     backup_file = os.path.join(self._postgresql.data_dir, f + '.backup')
                     if os.path.isfile(config_file):
                         shutil.copy(config_file, backup_file)
+                        self.set_file_permissions(backup_file)
             except IOError:
                 logger.exception('unable to create backup copies of configuration files')
         return True
@@ -393,9 +420,11 @@ class ConfigHandler(object):
                 if not os.path.isfile(config_file):
                     if os.path.isfile(backup_file):
                         shutil.copy(backup_file, config_file)
+                        self.set_file_permissions(config_file)
                     # Previously we didn't backup pg_ident.conf, if file is missing just create empty
                     elif f == 'pg_ident.conf':
                         open(config_file, 'w').close()
+                        self.set_file_permissions(config_file)
         except IOError:
             logger.exception('unable to restore configuration files from backup')
 
@@ -409,7 +438,7 @@ class ConfigHandler(object):
         if self._postgresql.enforce_hot_standby_feedback:
             configuration['hot_standby_feedback'] = 'on'
 
-        with ConfigWriter(self._postgresql_conf) as f:
+        with self.config_writer(self._postgresql_conf) as f:
             include = self._config.get('custom_conf') or self._postgresql_base_conf_name
             f.writeline("include '{0}'\n".format(ConfigWriter.escape(include)))
             for name, value in sorted((configuration).items()):
@@ -439,6 +468,7 @@ class ConfigHandler(object):
         if not self.hba_file and not self._config.get('pg_hba'):
             with open(self._pg_hba_conf, 'a') as f:
                 f.write('\n{}\n'.format('\n'.join(config)))
+            self.set_file_permissions(self._pg_hba_conf)
         return True
 
     def replace_pg_hba(self) -> Optional[bool]:
@@ -458,14 +488,14 @@ class ConfigHandler(object):
                                   self.local_replication_address['host'], self.local_replication_address['port'],
                                   0, socket.SOCK_STREAM, socket.IPPROTO_TCP)})
 
-            with ConfigWriter(self._pg_hba_conf) as f:
+            with self.config_writer(self._pg_hba_conf) as f:
                 for address, t in addresses.items():
                     f.writeline((
                         '{0}\treplication\t{1}\t{3}\ttrust\n'
                         '{0}\tall\t{2}\t{3}\ttrust'
                     ).format(t, self.replication['username'], self._superuser.get('username') or 'all', address))
         elif not self.hba_file and self._config.get('pg_hba'):
-            with ConfigWriter(self._pg_hba_conf) as f:
+            with self.config_writer(self._pg_hba_conf) as f:
                 f.writelines(self._config['pg_hba'])
             return True
 
@@ -478,7 +508,7 @@ class ConfigHandler(object):
         """
 
         if not self.ident_file and self._config.get('pg_ident'):
-            with ConfigWriter(self._pg_ident_conf) as f:
+            with self.config_writer(self._pg_ident_conf) as f:
                 f.writelines(self._config['pg_ident'])
             return True
 
@@ -593,7 +623,24 @@ class ConfigHandler(object):
                                           'recovery_target_action', 'standby_mode', self._triggerfile_wrong_name})
         return CaseInsensitiveSet(self._RECOVERY_PARAMETERS - skip_params)
 
-    def _read_recovery_params(self) -> Tuple[Optional[CaseInsensitiveDict], Optional[bool]]:
+    def _read_recovery_params(self) -> Tuple[Optional[CaseInsensitiveDict], bool]:
+        """Read current recovery parameters values.
+
+        .. note::
+            We query Postgres only if we detected that Postgresql was restarted
+            or when at least one of the following files was updated:
+
+                * ``postgresql.conf``;
+                * ``postgresql.auto.conf``;
+                * ``passfile`` that is used in the ``primary_conninfo``.
+
+        :returns: a tuple with two elements:
+
+            * :class:`CaseInsensitiveDict` object with current values of recovery parameters,
+              or ``None`` if no configuration files were updated;
+
+            * ``True`` if new values of recovery parameters were queried, ``False`` otherwise.
+        """
         if self._postgresql.is_starting():
             return None, False
 
@@ -614,11 +661,20 @@ class ConfigHandler(object):
             self._postgresql_conf_mtime = pg_conf_mtime
             self._auto_conf_mtime = auto_conf_mtime
             self._postmaster_ctime = postmaster_ctime
-        except Exception:
+        except Exception as exc:
+            if all((isinstance(exc, PostgresConnectionException),
+                    self._postgresql_conf_mtime == pg_conf_mtime,
+                    self._auto_conf_mtime == auto_conf_mtime,
+                    self._passfile_mtime == passfile_mtime,
+                    self._postmaster_ctime != postmaster_ctime)):
+                # We detected that the connection to postgres fails, but the process creation time of the postmaster
+                # doesn't match the old value. It is an indicator that Postgres crashed and either doing crash
+                # recovery or down. In this case we return values like nothing changed in the config.
+                return None, False
             values = None
         return values, True
 
-    def _read_recovery_params_pre_v12(self) -> Tuple[Optional[CaseInsensitiveDict], Optional[bool]]:
+    def _read_recovery_params_pre_v12(self) -> Tuple[Optional[CaseInsensitiveDict], bool]:
         recovery_conf_mtime = mtime(self._recovery_conf)
         passfile_mtime = mtime(self._passfile) if self._passfile else False
         if recovery_conf_mtime == self._recovery_conf_mtime and passfile_mtime == self._passfile_mtime:
@@ -800,9 +856,11 @@ class ConfigHandler(object):
         if self._postgresql.major_version >= 120000:
             if parse_bool(recovery_params.pop('standby_mode', None)):
                 open(self._standby_signal, 'w').close()
+                self.set_file_permissions(self._standby_signal)
             else:
                 self._remove_file_if_exists(self._standby_signal)
                 open(self._recovery_signal, 'w').close()
+                self.set_file_permissions(self._recovery_signal)
 
             def restart_required(name: str) -> bool:
                 if self._postgresql.major_version >= 140000:
@@ -813,8 +871,7 @@ class ConfigHandler(object):
             self._current_recovery_params = CaseInsensitiveDict({n: [v, restart_required(n), self._postgresql_conf]
                                                                  for n, v in recovery_params.items()})
         else:
-            with ConfigWriter(self._recovery_conf) as f:
-                os.chmod(self._recovery_conf, stat.S_IWRITE | stat.S_IREAD)
+            with self.config_writer(self._recovery_conf) as f:
                 self._write_recovery_params(f, recovery_params)
 
     def remove_recovery_conf(self) -> None:
@@ -843,6 +900,7 @@ class ConfigHandler(object):
         if overwrite:
             try:
                 with open(self._auto_conf, 'w') as f:
+                    self.set_file_permissions(self._auto_conf)
                     for raw_line in lines:
                         f.write(raw_line)
             except Exception:
@@ -910,24 +968,32 @@ class ConfigHandler(object):
                 return 'localhost'  # connection via localhost is preferred
         return listen_addresses[0].strip()  # can't use localhost, take first address from listen_addresses
 
-    @property
-    def local_connect_kwargs(self) -> Dict[str, Any]:
-        ret = self._local_address.copy()
-        # add all of the other connection settings that are available
-        ret.update(self._superuser)
-        # if the "username" parameter is present, it actually needs to be "user"
-        # for connecting to PostgreSQL
-        if 'username' in self._superuser:
-            ret['user'] = self._superuser['username']
-            del ret['username']
-        # ensure certain Patroni configurations are available
-        ret.update({'dbname': self._postgresql.database,
-                    'fallback_application_name': 'Patroni',
-                    'connect_timeout': 3,
-                    'options': '-c statement_timeout=2000'})
-        return ret
-
     def resolve_connection_addresses(self) -> None:
+        """Calculates and sets local and remote connection urls and options.
+
+        This method sets:
+            * :attr:`Postgresql.connection_string <patroni.postgresql.Postgresql.connection_string>` attribute, which
+              is later written to the member key in DCS as ``conn_url``.
+            * :attr:`ConfigHandler.local_replication_address` attribute, which is used for replication connections to
+              local postgres.
+            * :attr:`ConnectionPool.conn_kwargs <patroni.postgresql.connection.ConnectionPool.conn_kwargs>` attribute,
+              which is used for superuser connections to local postgres.
+
+        .. note::
+            If there is a valid directory in ``postgresql.parameters.unix_socket_directories`` in the Patroni
+            configuration and ``postgresql.use_unix_socket`` and/or ``postgresql.use_unix_socket_repl``
+            are set to ``True``, we respectively use unix sockets for superuser and replication connections
+            to local postgres.
+
+            If there is a requirement to use unix sockets, but nothing is set in the
+            ``postgresql.parameters.unix_socket_directories``, we omit a ``host`` in connection parameters relying
+            on the ability of ``libpq`` to connect via some default unix socket directory.
+
+            If unix sockets are not requested we "switch" to TCP, prefering to use ``localhost`` if it is possible
+            to deduce that Postgres is listening on a local interface address.
+
+            Otherwise we just used the first address specified in the ``listen_addresses`` GUC.
+        """
         port = self._server_parameters['port']
         tcp_local_address = self._get_tcp_local_address()
         netloc = self._config.get('connect_address') or tcp_local_address + ':' + port
@@ -940,12 +1006,25 @@ class ConfigHandler(object):
 
         tcp_local_address = {'host': tcp_local_address, 'port': port}
 
-        self._local_address = unix_local_address if self._config.get('use_unix_socket') else tcp_local_address
         self.local_replication_address = unix_local_address\
             if self._config.get('use_unix_socket_repl') else tcp_local_address
 
         self._postgresql.connection_string = uri('postgres', netloc, self._postgresql.database)
-        self._postgresql.set_connection_kwargs(self.local_connect_kwargs)
+
+        local_address = unix_local_address if self._config.get('use_unix_socket') else tcp_local_address
+        local_conn_kwargs = {
+            **local_address,
+            **self._superuser,
+            'dbname': self._postgresql.database,
+            'fallback_application_name': 'Patroni',
+            'connect_timeout': 3,
+            'options': '-c statement_timeout=2000'
+        }
+        # if the "username" parameter is present, it actually needs to be "user" for connecting to PostgreSQL
+        if 'username' in local_conn_kwargs:
+            local_conn_kwargs['user'] = local_conn_kwargs.pop('username')
+        # "notify" connection_pool about the "new" local connection address
+        self._postgresql.connection_pool.conn_kwargs = local_conn_kwargs
 
     def _get_pg_settings(
             self, names: Collection[str]
@@ -1061,10 +1140,10 @@ class ConfigHandler(object):
             if self._postgresql.major_version >= 90500:
                 time.sleep(1)
                 try:
-                    pending_restart = (self._postgresql.query(
+                    pending_restart = self._postgresql.query(
                         'SELECT COUNT(*) FROM pg_catalog.pg_settings'
                         ' WHERE pg_catalog.lower(name) != ALL(%s) AND pending_restart',
-                        [n.lower() for n in self._RECOVERY_PARAMETERS]).fetchone() or (0,))[0] > 0
+                        [n.lower() for n in self._RECOVERY_PARAMETERS])[0][0] > 0
                     self._postgresql.set_pending_restart(pending_restart)
                 except Exception as e:
                     logger.warning('Exception %r when running query', e)

@@ -65,14 +65,14 @@ class TestRewind(BaseTestPostgresql):
 
     def test_pg_rewind(self):
         r = {'user': '', 'host': '', 'port': '', 'database': '', 'password': ''}
-        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=150000)),\
+        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=150000)), \
                 patch.object(CancellableSubprocess, 'call', Mock(return_value=None)):
             with patch('subprocess.check_output', Mock(return_value=b'boo')):
                 self.assertFalse(self.r.pg_rewind(r))
             with patch('subprocess.check_output', Mock(side_effect=Exception)):
                 self.assertFalse(self.r.pg_rewind(r))
 
-        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=120000)),\
+        with patch.object(Postgresql, 'major_version', PropertyMock(return_value=120000)), \
                 patch('subprocess.check_output', Mock(return_value=b'foo %f %p %r %% % %')):
             with patch.object(CancellableSubprocess, 'call', mock_cancellable_call):
                 self.assertFalse(self.r.pg_rewind(r))
@@ -91,9 +91,10 @@ class TestRewind(BaseTestPostgresql):
                                              'Latest checkpoint location': '0/'})):
             self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
 
-        with patch.object(Postgresql, 'is_running', Mock(return_value=True)),\
-                patch.object(MockCursor, 'fetchone',
-                             Mock(side_effect=[(0, 0, 1, 1, 0, 0, 0, 0, 0, None, None, None), Exception])):
+        with patch.object(Postgresql, 'is_running', Mock(return_value=True)), \
+                patch.object(MockCursor, 'fetchone', Mock(side_effect=Exception)), \
+                patch.object(MockCursor, 'fetchall',
+                             Mock(return_value=[(0, 0, 1, 1, 0, 0, 0, 0, 0, None, None, None)])):
             self.r.rewind_or_reinitialize_needed_and_possible(self.leader)
 
     @patch.object(CancellableSubprocess, 'call', mock_cancellable_call)
@@ -239,7 +240,7 @@ class TestRewind(BaseTestPostgresql):
 
         with patch('os.listdir', Mock(return_value=['000000000000000000000000.ready'])):
             # successful archive_command call
-            with patch.object(CancellableSubprocess, 'call', Mock(return_value=0)):
+            with patch.object(CancellableSubprocess, 'call', Mock(return_value=0)) as mock_subprocess_call:
                 get_guc_value_res = [
                     'on', 'command %f',
                     'always', 'command %f',
@@ -252,6 +253,10 @@ class TestRewind(BaseTestPostgresql):
                                           '000000000000000000000000', 'command 000000000000000000000000'),
                                          mock_logger_info.call_args[0])
                         mock_logger_info.reset_mock()
+                        mock_subprocess_call.assert_called_once()
+                        self.assertEqual(mock_subprocess_call.call_args[0][0], ['command 000000000000000000000000'])
+                        self.assertEqual(mock_subprocess_call.call_args[1]['shell'], True)
+                        mock_subprocess_call.reset_mock()
 
             # failed archive_command call
             with patch.object(CancellableSubprocess, 'call', Mock(return_value=1)):

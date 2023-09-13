@@ -3,6 +3,128 @@
 Release notes
 =============
 
+Version 3.1.0
+-------------
+
+**Breaking changes**
+
+- Changed semantic of ``restapi.keyfile`` and ``restapi.certfile`` (Alexander Kukushkin)
+
+  Previously Patroni was using ``restapi.keyfile`` and ``restapi.certfile`` as client certificates as a fallback if there were no respective configuration parameters in the ``ctl`` section.
+
+.. warning::
+    If you enabled client certificates validation (``restapi.verify_client`` is set to ``required``), you also **must** provide **valid client certificates** in the ``ctl.certfile``, ``ctl.keyfile``, ``ctl.keyfile_password``. If not provided, Patroni will not work correctly.
+
+
+**New features**
+
+- Make Pod role label configurable (Waynerv)
+
+  Values could be customized using ``kubernetes.leader_label_value``, ``kubernetes.follower_label_value`` and ``kubernetes.standby_leader_label_value`` parameters. This feature will be very useful when we change the ``master`` role to the ``primary``. You can read more about the feature and migration steps :ref:`here <kubernetes_role_values>`.
+
+
+**Improvements**
+
+- Various improvements of ``patroni --validate-config`` (Alexander Kukushkin)
+
+  Improved parameter validation for different DCS, ``bootstrap.dcs`` , ``ctl``, ``restapi``, and ``watchdog`` sections.
+
+- Start Postgres not in recovery if it crashed during recovery while Patroni is running (Alexander Kukushkin)
+
+  It may reduce recovery time and will help to prevent unnecessary timeline increments.
+
+- Avoid unnecessary updates of ``/status`` key (Alexander Kukushkin)
+
+  When there are no permanent logical slots Patroni was updating the ``/status`` on every heartbeat loop even when LSN on the primary didn't move forward.
+
+- Don't allow stale primary to win the leader race (Alexander Kukushkin)
+
+  If Patroni was hanging during a significant time due to lack of resources it will additionally check that no other nodes promoted Postgres before acquiring the leader lock.
+
+- Implemented visibility of certain PostgreSQL parameters validation (Alexander Kukushkin, Feike Steenbergen)
+
+  If validation of ``max_connections``, ``max_wal_senders``, ``max_prepared_transactions``, ``max_locks_per_transaction``, ``max_replication_slots``, or ``max_worker_processes`` failed Patroni was using some sane default value. Now in addition to that it will also show a warning.
+
+- Set permissions for files and directories created in ``PGDATA`` (Alexander Kukushkin)
+
+  All files created by Patroni had only owner read/write permissions. This behaviour was breaking backup tools that run under a different user and relying on group read permissions. Now Patroni honors permissions on ``PGDATA`` and correctly sets permissions on all directories and files it creates inside ``PGDATA``.
+
+
+**Bugfixes**
+
+- Run ``archive_command`` through shell (Waynerv)
+
+  Patroni might archive some WAL segments before doing crash recovery in a single-user mode or before ``pg_rewind``. If the archive_command contains some shell operators, like ``&&`` it didn't work with Patroni.
+
+- Fixed "on switchover" shutdown checks (Polina Bungina)
+
+  It was possible that specified candidate is still streaming and didn't received shut down checking but the leader key was removed because some other nodes were healthy.
+
+- Fixed "is primary" check (Alexander Kukushkin)
+
+  During the leader race replicas were not able to recognize that Postgres on the old leader is still running as a primary.
+
+- Fixed ``patronictl list`` (Alexander Kukushkin)
+
+  The Cluster name field was missing in ``tsv``, ``json``, and ``yaml`` output formats.
+
+- Fixed ``pg_rewind`` behaviour after pause (Alexander Kukushkin)
+
+  Under certain conditions, Patroni wasn't able to join the false primary back to the cluster with ``pg_rewind`` after coming out of maintenance mode.
+
+- Fixed bug in Etcd v3 implementation (Alexander Kukushkin)
+
+  Invalidate internal KV cache if key update performed using ``create_revision``/``mod_revision`` field due to revision mismatch.
+
+- Fixed behaviour of replicas in standby cluster in pause (Alexander Kukushkin)
+
+  When the leader key expires replicas in standby cluster will not follow the remote node but keep ``primary_conninfo`` as it is.
+
+
+Version 3.0.4
+-------------
+
+**New features**
+
+- Make the replication status of standby nodes visible (Alexander Kukushkin)
+
+  For PostgreSQL 9.6+ Patroni will report the replication state as ``streaming`` when the standby is streaming from the other node or ``in archive recovery`` when there is no replication connection and ``restore_command`` is set. The state is visible in ``member`` keys in DCS, in the REST API, and in ``patronictl list`` output.
+
+
+**Improvements**
+
+- Improved error messages with Etcd v3 (Alexander Kukushkin)
+
+  When Etcd v3 cluster isn't accessible Patroni was reporting that it can't access ``/v2`` endpoints.
+
+- Use quorum read in ``patronictl`` if it is possible (Alexander Kukushkin)
+
+  Etcd or Consul clusters could be degraded to read-only, but from the ``patronictl`` view everything was fine. Now it will fail with the error.
+
+- Prevent splitbrain from duplicate names in configuration (Mark Pekala)
+
+  When starting Patroni will check if node with the same name is registered in DCS, and try to query its REST API. If REST API is accessible Patroni exits with an error. It will help to protect from the human error.
+
+- Start Postgres not in recovery if it crashed while Patroni is running (Alexander Kukushkin)
+
+  It may reduce recovery time and will help from unnecessary timeline increments.
+
+
+**Bugfixes**
+
+- REST API SSL certificate were not reloaded upon receiving a SIGHUP (Israel Barth Rubio)
+
+  Regression was introduced in 3.0.3.
+
+- Fixed integer GUCs validation for parameters like ``max_connections`` (Feike Steenbergen)
+
+  Patroni didn't like quoted numeric values. Regression was introduced in 3.0.3.
+
+- Fix issue with ``synchronous_mode`` (Alexander Kukushkin)
+
+  Execute ``txid_current()`` with ``synchronous_commit=off`` so it doesn't accidentally wait for absent synchronous standbys when ``synchronous_mode_strict`` is enabled.
+
+
 Version 3.0.3
 -------------
 

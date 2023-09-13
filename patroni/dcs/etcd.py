@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 from urllib3 import Timeout
 from urllib3.exceptions import HTTPError, ReadTimeoutError, ProtocolError
 
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, SyncState,\
+from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, SyncState, \
     TimelineHistory, ReturnFalseException, catch_return_false_exception, citus_group_re
 from ..exceptions import DCSError
 from ..request import get as requests_get
@@ -809,7 +809,7 @@ class Etcd(AbstractEtcd):
         return bool(self.retry(self._client.write, self.initialize_path, sysid, prevExist=(not create_new)))
 
     @catch_etcd_errors
-    def _delete_leader(self) -> bool:
+    def _delete_leader(self, leader: Leader) -> bool:
         return bool(self._client.delete(self.leader_path, prevValue=self._name))
 
     @catch_etcd_errors

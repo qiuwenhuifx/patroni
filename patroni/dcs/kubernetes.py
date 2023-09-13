@@ -19,10 +19,10 @@ from urllib3.exceptions import HTTPError
 from threading import Condition, Lock, Thread
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Type, Union, TYPE_CHECKING
 
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, SyncState,\
+from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, SyncState, \
     TimelineHistory, CITUS_COORDINATOR_GROUP_ID, citus_group_re
 from ..exceptions import DCSError
-from ..utils import deep_compare, iter_response_objects, keepalive_socket_options,\
+from ..utils import deep_compare, iter_response_objects, keepalive_socket_options, \
     Retry, RetryFailedError, tzutc, uri, USER_AGENT
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -134,6 +134,8 @@ class K8sConfig(object):
             config: Dict[str, Any] = yaml.safe_load(f)
 
         context = context or config['current-context']
+        if TYPE_CHECKING:  # pragma: no cover
+            assert isinstance(context, str)
         context_value = self._get_by_name(config, 'context', context)
         if TYPE_CHECKING:  # pragma: no cover
             assert isinstance(context_value, dict)
@@ -752,6 +754,10 @@ class Kubernetes(AbstractDCS):
         self._label_selector = ','.join('{0}={1}'.format(k, v) for k, v in self._labels.items())
         self._namespace = config.get('namespace') or 'default'
         self._role_label = config.get('role_label', 'role')
+        self._leader_label_value = config.get('leader_label_value', 'master')
+        self._follower_label_value = config.get('follower_label_value', 'replica')
+        self._standby_leader_label_value = config.get('standby_leader_label_value', 'master')
+        self._tmp_role_label = config.get('tmp_role_label')
         self._ca_certs = os.environ.get('PATRONI_KUBERNETES_CACERT', config.get('cacert')) or SERVICE_CERT_FILENAME
         super(Kubernetes, self).__init__({**config, 'namespace': ''})
         if self._citus_group:
@@ -1134,6 +1140,13 @@ class Kubernetes(AbstractDCS):
         """Unused"""
         raise NotImplementedError  # pragma: no cover
 
+    def write_leader_optime(self, last_lsn: int) -> None:
+        """Write value for WAL LSN to ``optime`` annotation of the leader object.
+
+        :param last_lsn: absolute WAL LSN in bytes.
+        """
+        self.patch_or_create(self.leader_path, {self._OPTIME: str(last_lsn)}, patch=True, retry=False)
+
     def _update_leader_with_retry(self, annotations: Dict[str, Any],
                                   resource_version: Optional[str], ips: List[str]) -> bool:
         retry = self._retry.copy()
@@ -1263,19 +1276,27 @@ class Kubernetes(AbstractDCS):
     def touch_member(self, data: Dict[str, Any]) -> bool:
         cluster = self.cluster
         if cluster and cluster.leader and cluster.leader.name == self._name:
-            role = 'master'
+            role = self._standby_leader_label_value if data['role'] == 'standby_leader' else self._leader_label_value
+            tmp_role = 'master'
         elif data['state'] == 'running' and data['role'] not in ('master', 'primary'):
-            role = data['role']
+            role = {'replica': self._follower_label_value}.get(data['role'], data['role'])
+            tmp_role = data['role']
         else:
             role = None
+            tmp_role = None
+
+        role_labels = {self._role_label: role}
+        if self._tmp_role_label:
+            role_labels[self._tmp_role_label] = tmp_role
 
         member = cluster and cluster.get_member(self._name, fallback_to_leader=False)
         pod_labels = member and member.data.pop('pod_labels', None)
         ret = member and pod_labels is not None\
-            and pod_labels.get(self._role_label) == role and deep_compare(data, member.data)
+            and all(pod_labels.get(k) == v for k, v in role_labels.items())\
+            and deep_compare(data, member.data)
 
         if not ret:
-            metadata = {'namespace': self._namespace, 'name': self._name, 'labels': {self._role_label: role},
+            metadata = {'namespace': self._namespace, 'name': self._name, 'labels': role_labels,
                         'annotations': {'status': json.dumps(data, separators=(',', ':'))}}
             body = k8s_client.V1Pod(metadata=k8s_client.V1ObjectMeta(**metadata))
             ret = self._api.patch_namespaced_pod(self._name, self._namespace, body)
@@ -1291,11 +1312,11 @@ class Kubernetes(AbstractDCS):
             if cluster and cluster.config and cluster.config.version else None
         return self.patch_or_create_config({self._INITIALIZE: sysid}, resource_version)
 
-    def _delete_leader(self) -> bool:
+    def _delete_leader(self, leader: Leader) -> bool:
         """Unused"""
         raise NotImplementedError  # pragma: no cover
 
-    def delete_leader(self, last_lsn: Optional[int] = None) -> bool:
+    def delete_leader(self, leader: Optional[Leader], last_lsn: Optional[int] = None) -> bool:
         ret = False
         kind = self._kinds.get(self.leader_path)
         if kind and (kind.metadata.annotations or {}).get(self._LEADER) == self._name:

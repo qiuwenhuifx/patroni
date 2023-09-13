@@ -30,9 +30,15 @@ Log
 
 Bootstrap configuration
 -----------------------
+
+.. note::
+    Once Patroni has initialized the cluster for the first time and settings have been stored in the DCS, all future
+    changes to the ``bootstrap.dcs`` section of the YAML configuration will not take any effect! If you want to change
+    them please use either ``patronictl edit-config`` or the Patroni :ref:`REST API <rest_api>`.
+
 -  **bootstrap**:
 
-   -  **dcs**: This section will be written into `/<namespace>/<scope>/config` of the given configuration store after initializing of new cluster. The global dynamic configuration for the cluster. Under the ``bootstrap.dcs`` you can put any of the parameters described in the :ref:`Dynamic Configuration settings <dynamic_configuration>` and after Patroni initialized (bootstrapped) the new cluster, it will write this section into `/<namespace>/<scope>/config` of the configuration store. All later changes of ``bootstrap.dcs`` will not take any effect! If you want to change them please use either ``patronictl edit-config`` or Patroni :ref:`REST API <rest_api>`.
+   -  **dcs**: This section will be written into `/<namespace>/<scope>/config` of the given configuration store after initializing the new cluster. The global dynamic configuration for the cluster. You can put any of the parameters described in the :ref:`Dynamic Configuration settings <dynamic_configuration>` under ``bootstrap.dcs`` and after Patroni has initialized (bootstrapped) the new cluster, it will write this section into `/<namespace>/<scope>/config` of the configuration store.
    -  **method**: custom script to use for bootstrapping this cluster.
 
       See :ref:`custom bootstrap methods documentation <custom_bootstrap>` for details.
@@ -43,16 +49,23 @@ Bootstrap configuration
       -  **- data-checksums**: Must be enabled when pg_rewind is needed on 9.3.
       -  **- encoding: UTF8**: default encoding for new databases.
       -  **- locale: UTF8**: default locale for new databases.
-   -  **users**: Some additional users which need to be created after initializing new cluster
-
-      -  **admin**: the name of user
-
-         -  **password**: (optional) password for the user
-         -  **options**: list of options for CREATE USER statement
-
-            -  **- createrole**
-            -  **- createdb**
+   -  **users**: Some additional users which need to be created after initializing new cluster, see :ref:`Bootstrap users configuration <bootstrap_users_configuration>` below.
    -  **post\_bootstrap** or **post\_init**: An additional script that will be executed after initializing the cluster. The script receives a connection string URL (with the cluster superuser as a user name). The PGPASSFILE variable is set to the location of pgpass file.
+
+.. _bootstrap_users_configuration:
+
+Bootstrap users configuration
+=============================
+
+Users which need to be created after initializing the cluster:
+
+-  **admin**: the name of user
+
+  -  **password**: (optional) password for the user
+  -  **options**: list of options for CREATE USER statement
+
+    -  **- createrole**
+    -  **- createdb**
 
 .. _citus_settings:
 
@@ -155,7 +168,11 @@ Kubernetes
 -  **namespace**: (optional) Kubernetes namespace where Patroni pod is running. Default value is `default`.
 -  **labels**: Labels in format ``{label1: value1, label2: value2}``. These labels will be used to find existing objects (Pods and either Endpoints or ConfigMaps) associated with the current cluster. Also Patroni will set them on every object (Endpoint or ConfigMap) it creates.
 -  **scope\_label**: (optional) name of the label containing cluster name. Default value is `cluster-name`.
--  **role\_label**: (optional) name of the label containing role (master or replica). Patroni will set this label on the pod it runs in. Default value is ``role``.
+-  **role\_label**: (optional) name of the label containing role (master or replica or other custom value). Patroni will set this label on the pod it runs in. Default value is ``role``.
+-  **leader\_label\_value**: (optional) value of the pod label when Postgres role is ``master``. Default value is ``master``.
+-  **follower\_label\_value**: (optional) value of the pod label when Postgres role is ``replica``. Default value is ``replica``.
+-  **standby\_leader\_label\_value**: (optional) value of the pod label when Postgres role is ``standby_leader``. Default value is ``master``.
+-  **tmp_\role\_label**: (optional) name of the temporary label containing role (master or replica). Value of this label will always use the default of corresponding role. Set only when necessary.
 -  **use\_endpoints**: (optional) if set to true, Patroni will use Endpoints instead of ConfigMaps to run leader elections and keep cluster state.
 -  **pod\_ip**: (optional) IP address of the pod Patroni is running in. This value is required when `use_endpoints` is enabled and is used to populate the leader endpoint subsets when the pod's PostgreSQL is promoted.
 -  **ports**: (optional) if the Service object has the name for the port, the same name must appear in the Endpoint object, otherwise service won't work. For example, if your service is defined as ``{Kind: Service, spec: {ports: [{name: postgresql, port: 5432, targetPort: 5432}]}}``, then you have to set ``kubernetes.ports: [{"name": "postgresql", "port": 5432}]`` and Patroni will use it for updating subsets of the leader Endpoint. This parameter is used only if `kubernetes.use_endpoints` is set.
@@ -335,17 +352,27 @@ Here is an example of both **http_extra_headers** and **https_extra_headers**:
           https_extra_headers:
             'Strict-Transport-Security': 'max-age=31536000; includeSubDomains'
 
+.. warning::
+
+    - The ``restapi.connect_address`` must be accessible from all nodes of a given Patroni cluster. Internally Patroni is using it during the leader race to find nodes with minimal replication lag.
+    - If you enabled client certificates validation (``restapi.verify_client`` is set to ``required``), you also **must** provide **valid client certificates** in the ``ctl.certfile``, ``ctl.keyfile``, ``ctl.keyfile_password``. If not provided, Patroni will not work correctly.
+
+
 .. _patronictl_settings:
 
 CTL
 ---
 -  **ctl**: (optional)
 
+   -  **authentication**:
+
+      -  **username**: Basic-auth username for accessing protected REST API endpoints. If not provided patronictl will use the value provided for REST API "username" parameter.
+      -  **password**: Basic-auth password for accessing protected REST API endpoints. If not provided patronictl will use the value provided for REST API "password" parameter.
    -  **insecure**: Allow connections to REST API without verifying SSL certs.
    -  **cacert**: Specifies the file with the CA_BUNDLE file or directory with certificates of trusted CAs to use while verifying REST API SSL certs. If not provided patronictl will use the value provided for REST API "cafile" parameter.
-   -  **certfile**: Specifies the file with the client certificate in the PEM format. If not provided patronictl will use the value provided for REST API "certfile" parameter.
-   -  **keyfile**: Specifies the file with the client secret key in the PEM format. If not provided patronictl will use the value provided for REST API "keyfile" parameter.
-   -  **keyfile\_password**: Specifies a password for decrypting the keyfile. If not provided patronictl will use the value provided for REST API "keyfile\_password" parameter.
+   -  **certfile**: Specifies the file with the client certificate in the PEM format.
+   -  **keyfile**: Specifies the file with the client secret key in the PEM format.
+   -  **keyfile\_password**: Specifies a password for decrypting the client keyfile.
 
 Watchdog
 --------
