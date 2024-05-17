@@ -13,6 +13,7 @@ from . import Postgresql
 from .connection import get_connection_cursor
 from .misc import format_lsn, fsync_dir, parse_history, parse_lsn
 from ..async_executor import CriticalTask
+from ..collections import EMPTY_DICT
 from ..dcs import Leader, RemoteMember
 
 logger = logging.getLogger(__name__)
@@ -101,12 +102,26 @@ class Rewind(object):
             return 'not accessible or not healty'
 
     def _get_checkpoint_end(self, timeline: int, lsn: int) -> int:
-        """The checkpoint record size in WAL depends on postgres major version and platform (memory alignment).
-        Hence, the only reliable way to figure out where it ends, read the record from file with the help of pg_waldump
-        and parse the output. We are trying to read two records, and expect that it will fail to read the second one:
-        `pg_waldump: fatal: error in WAL record at 0/182E220: invalid record length at 0/182E298: wanted 24, got 0`
-        The error message contains information about LSN of the next record, which is exactly where checkpoint ends."""
+        """Get the end of checkpoint record from WAL.
 
+        .. note::
+            The checkpoint record size in WAL depends on postgres major version and platform (memory alignment).
+            Hence, the only reliable way to figure out where it ends, is to read the record from file with the
+            help of ``pg_waldump`` and parse the output.
+
+            We are trying to read two records, and expect that it will fail to read the second record with message:
+
+                fatal: error in WAL record at 0/182E220: invalid record length at 0/182E298: wanted 24, got 0; or
+
+                fatal: error in WAL record at 0/182E220: invalid record length at 0/182E298: expected at least 24, got 0
+
+            The error message contains information about LSN of the next record, which is exactly where checkpoint ends.
+
+        :param timeline: the checkpoint *timeline* from ``pg_controldata``.
+        :param lsn: the checkpoint *location* as :class:`int` from ``pg_controldata``.
+
+        :returns: the end of checkpoint record as :class:`int` or ``0`` if failed to parse ``pg_waldump`` output.
+        """
         lsn8 = format_lsn(lsn, True)
         lsn_str = format_lsn(lsn)
         out, err = self._postgresql.waldump(timeline, lsn_str, 2)
@@ -117,12 +132,17 @@ class Rewind(object):
 
             if len(out) == 1 and len(err) == 1 and ', lsn: {0}, prev '.format(lsn8) in out[0] and pattern in err[0]:
                 i = err[0].find(pattern) + len(pattern)
-                j = err[0].find(": wanted ", i)
-                if j > -1:
-                    try:
-                        return parse_lsn(err[0][i:j])
-                    except Exception as e:
-                        logger.error('Failed to parse lsn %s: %r', err[0][i:j], e)
+                # Message format depends on the major version:
+                # * expected at least -- starting from v16
+                # * wanted -- before v16
+                # We will simply check all possible combinations.
+                for pattern in (': expected at least ', ': wanted '):
+                    j = err[0].find(pattern, i)
+                    if j > -1:
+                        try:
+                            return parse_lsn(err[0][i:j])
+                        except Exception as e:
+                            logger.error('Failed to parse lsn %s: %r', err[0][i:j], e)
             logger.error('Failed to parse pg_%sdump output', self._postgresql.wal_name)
             logger.error(' stdout=%s', '\n'.join(out))
             logger.error(' stderr=%s', '\n'.join(err))
@@ -158,7 +178,7 @@ class Rewind(object):
     def _get_local_timeline_lsn(self) -> Tuple[Optional[bool], Optional[int], Optional[int]]:
         if self._postgresql.is_running():  # if postgres is running - get timeline from replication connection
             in_recovery = True
-            timeline = self._postgresql.received_timeline() or self._postgresql.get_replica_timeline()
+            timeline = self._postgresql.get_replica_timeline()
             lsn = self._postgresql.replayed_location()
         else:  # otherwise analyze pg_controldata output
             in_recovery, timeline, lsn = self._get_local_timeline_lsn_from_controldata()
@@ -190,9 +210,10 @@ class Rewind(object):
         ret = member.conn_kwargs(auth)
         if not ret.get('dbname'):
             ret['dbname'] = self._postgresql.database
-        # Add target_session_attrs in case more than one hostname is specified
-        # (libpq client-side failover) making sure we hit the primary
-        if 'target_session_attrs' not in ret and self._postgresql.major_version >= 100000:
+        # Add target_session_attrs to make sure we hit the primary.
+        # It is not strictly necessary for starting from PostgreSQL v14, which made it possible
+        # to rewind from standby, but doing it from the real primary is always safer.
+        if self._postgresql.major_version >= 100000:
             ret['target_session_attrs'] = 'read-write'
         return ret
 
@@ -398,7 +419,7 @@ class Rewind(object):
         dsn = self._postgresql.config.format_dsn(r, True)
         logger.info('running pg_rewind from %s', dsn)
 
-        restore_command = (self._postgresql.config.get('recovery_conf') or {}).get('restore_command') \
+        restore_command = (self._postgresql.config.get('recovery_conf') or EMPTY_DICT).get('restore_command') \
             if self._postgresql.major_version < 120000 else self._postgresql.get_guc_value('restore_command')
 
         # Until v15 pg_rewind expected postgresql.conf to be inside $PGDATA, which is not the case on e.g. Debian

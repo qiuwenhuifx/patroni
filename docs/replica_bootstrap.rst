@@ -1,3 +1,5 @@
+.. _replica_imaging_and_bootstrap:
+
 Replica imaging and bootstrap
 =============================
 
@@ -43,19 +45,49 @@ in the configuration files, Patroni supplies two cluster-specific ones:
 
 Passing these two additional flags can be disabled by setting a special ``no_params`` parameter to ``True``.
 
-If the bootstrap script returns 0, Patroni tries to configure and start the PostgreSQL instance produced by it. If any
+If the bootstrap script returns ``0``, Patroni tries to configure and start the PostgreSQL instance produced by it. If any
 of the intermediate steps fail, or the script returns a non-zero value, Patroni assumes that the bootstrap has failed,
 cleans up after itself and releases the initialize lock to give another node the opportunity to bootstrap.
 
 If a ``recovery_conf`` block is defined in the same section as the custom bootstrap method, Patroni will generate a
-``recovery.conf`` before starting the newly bootstrapped instance. Typically, such recovery.conf should contain at least
-one of the ``recovery_target_*`` parameters, together with the ``recovery_target_timeline`` set to ``promote``.
+``recovery.conf`` before starting the newly bootstrapped instance (or set the recovery settings on Postgres configuration if
+running PostgreSQL >= 12).
+Typically, such recovery configuration should contain at least one of the ``recovery_target_*`` parameters, together with the ``recovery_target_timeline`` set to ``promote``.
 
-If ``keep_existing_recovery_conf`` is defined and set to ``True``, Patroni will not remove the existing ``recovery.conf`` file if it exists.
-This is useful when bootstrapping from a backup with tools like pgBackRest that generate the appropriate ``recovery.conf`` for you.
+If ``keep_existing_recovery_conf`` is defined and set to ``True``, Patroni will not remove the existing ``recovery.conf`` file if it exists (PostgreSQL <= 11).
+Similarly, in that case Patroni will not remove the existing ``recovery.signal`` or ``standby.signal`` if either exists, nor will it override the configured recovery settings (PostgreSQL >= 12).
+This is useful when bootstrapping from a backup with tools like pgBackRest that generate the appropriate recovery configuration for you.
+
+Besides that, any additional key/value pairs informed in the custom bootstrap method configuration will be passed as arguments to ``command`` in the format ``--name=value``. For example:
+
+.. code:: YAML
+
+    bootstrap:
+        method: <custom_bootstrap_method_name>
+        <custom_bootstrap_method_name>:
+            command: <path_to_custom_bootstrap_script>
+            arg1: value1
+            arg2: value2
+
+Makes the configured ``command`` to be called additionally with ``--arg1=value1 --arg2=value2`` command-line arguments.
 
  .. note:: Bootstrap methods are neither chained, nor fallen-back to the default one in case the primary one fails
 
+As an example, you are able to bootstrap a fresh Patroni cluster from a Barman backup with a configuration like this:
+
+.. code:: YAML
+
+    bootstrap:
+        method: barman
+        barman:
+            keep_existing_recovery_conf: true
+            command: patroni_barman --api-url https://barman-host:7480 recover
+            barman-server: my_server
+            ssh-command: ssh postgres@patroni-host
+
+.. note::
+    ``patroni_barman recover`` requires that you have both Barman and ``pg-backup-api`` configured in the Barman host, so it can execute a remote ``barman recover`` through the backup API.
+    The above example uses a subset of the available parameters. You can get more information running ``patroni_barman recover --help``.
 
 .. _custom_replica_creation:
 
@@ -110,6 +142,24 @@ example: pgbackrest
         basebackup:
             max-rate: '100M'
 
+example: Barman
+
+.. code:: YAML
+
+    postgresql:
+        create_replica_methods:
+            - barman
+            - basebackup
+        barman:
+            command: patroni_barman --api-url https://barman-host:7480 recover
+            barman-server: my_server
+            ssh-command: ssh postgres@patroni-host
+        basebackup:
+            max-rate: '100M'
+
+.. note::
+    ``patroni_barman recover`` requires that you have both Barman and ``pg-backup-api`` configured in the Barman host, so it can execute a remote ``barman recover`` through the backup API.
+    The above example uses a subset of the available parameters. You can get more information running ``patroni_barman recover --help``.
 
 The ``create_replica_methods`` defines available replica creation methods and the order of executing them. Patroni will
 stop on the first one that returns 0. Each method should define a separate section in the configuration file, listing the command
@@ -169,59 +219,3 @@ and
             - waldir: /pg-wal-mount/external-waldir
 
 If all replica creation methods fail, Patroni will try again all methods in order during the next event loop cycle.
-
-.. _standby_cluster:
-
-Standby cluster
----------------
-
-Another available option is to run a "standby cluster", that contains only of
-standby nodes replicating from some remote node. This type of clusters has:
-
-* "standby leader", that behaves pretty much like a regular cluster leader,
-  except it replicates from a remote node.
-
-* cascade replicas, that are replicating from standby leader.
-
-Standby leader holds and updates a leader lock in DCS. If the leader lock
-expires, cascade replicas will perform an election to choose another leader
-from the standbys.
-
-There is no further relationship between the standby cluster and the primary
-cluster it replicates from, in particular, they must not share the same DCS
-scope if they use the same DCS. They do not know anything else from each other
-apart from replication information. Also, the standby cluster is not being
-displayed in ``patronictl list`` or ``patronictl topology`` output on the
-primary cluster.
-
-For the sake of flexibility, you can specify methods of creating a replica and
-recovery WAL records when a cluster is in the "standby mode" by providing
-`create_replica_methods` key in `standby_cluster` section. It is distinct from
-creating replicas, when cluster is detached and functions as a normal cluster,
-which is controlled by `create_replica_methods` in `postgresql` section. Both
-"standby" and "normal" `create_replica_methods` reference  keys in `postgresql`
-section.
-
-To configure such cluster you need to specify the section ``standby_cluster``
-in a patroni configuration:
-
-.. code:: YAML
-
-    bootstrap:
-        dcs:
-            standby_cluster:
-                host: 1.2.3.4
-                port: 5432
-                primary_slot_name: patroni
-                create_replica_methods:
-                - basebackup
-
-Note, that these options will be applied only once during cluster bootstrap,
-and the only way to change them afterwards is through DCS.
-
-Patroni expects to find `postgresql.conf` or `postgresql.conf.backup` in PGDATA
-of the remote primary and will not start if it does not find it after a
-basebackup. If the remote primary keeps its `postgresql.conf` elsewhere, it is
-your responsibility to copy it to PGDATA.
-
-If you use replication slots on the standby cluster, you must also create the corresponding replication slot on the primary cluster.  It will not be done automatically by the standby cluster implementation.  You can use Patroni's permanent replication slots feature on the primary cluster to maintain a replication slot with the same name as ``primary_slot_name``, or its default value if ``primary_slot_name`` is not provided.

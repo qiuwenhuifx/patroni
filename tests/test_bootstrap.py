@@ -4,10 +4,11 @@ import sys
 from mock import Mock, PropertyMock, patch
 
 from patroni.async_executor import CriticalTask
+from patroni.collections import CaseInsensitiveDict
 from patroni.postgresql import Postgresql
 from patroni.postgresql.bootstrap import Bootstrap
 from patroni.postgresql.cancellable import CancellableSubprocess
-from patroni.postgresql.config import ConfigHandler
+from patroni.postgresql.config import ConfigHandler, get_param_diff
 
 from . import psycopg_connect, BaseTestPostgresql, mock_available_gucs
 
@@ -91,9 +92,20 @@ class TestBootstrap(BaseTestPostgresql):
         mock_cancellable_subprocess_call.return_value = 1
         self.assertEqual(self.b.create_replica(self.leader), 1)
 
+    @patch.object(CancellableSubprocess, 'call', Mock(return_value=0))
+    @patch.object(Postgresql, 'data_directory_empty', Mock(return_value=True))
     def test_basebackup(self):
-        self.p.cancellable.cancel()
-        self.b.basebackup(None, None, {'foo': 'bar'})
+        with patch('patroni.postgresql.bootstrap.logger.debug') as mock_debug:
+            self.p.cancellable.cancel()
+            self.b.basebackup("", None, {'foo': 'bar'})
+            mock_debug.assert_not_called()
+
+            self.p.cancellable.reset_is_cancelled()
+            self.b.basebackup("", None, {'foo': 'bar'})
+            mock_debug.assert_called_with(
+                'calling: %r',
+                ['pg_basebackup', f'--pgdata={self.p.data_dir}', '-X', 'stream', '--dbname=', '--foo=bar'],
+            )
 
     def test__initdb(self):
         self.assertRaises(Exception, self.b.bootstrap, {'initdb': [{'pgdata': 'bar'}]})
@@ -142,6 +154,16 @@ class TestBootstrap(BaseTestPostgresql):
                     (), error_handler
                 ),
                 ["--key=value with spaces"])
+            # not allowed options in list of dicts/strs are filtered out
+            self.assertEqual(
+                self.b.process_user_options(
+                    'pg_basebackup',
+                    [{'checkpoint': 'fast'}, {'dbname': 'dbname=postgres'}, 'gzip', {'label': 'standby'}, 'verbose'],
+                    ('dbname', 'verbose'),
+                    print
+                ),
+                ['--checkpoint=fast', '--gzip', '--label=standby'],
+            )
 
     @patch.object(CancellableSubprocess, 'call', Mock())
     @patch.object(Postgresql, 'is_running', Mock(return_value=True))
@@ -179,10 +201,17 @@ class TestBootstrap(BaseTestPostgresql):
     @patch.object(Postgresql, 'controldata', Mock(return_value={'Database cluster state': 'in production'}))
     def test_custom_bootstrap(self, mock_cancellable_subprocess_call):
         self.p.config._config.pop('pg_hba')
-        config = {'method': 'foo', 'foo': {'command': 'bar'}}
+        config = {'method': 'foo', 'foo': {'command': 'bar --arg1=val1'}}
 
         mock_cancellable_subprocess_call.return_value = 1
         self.assertFalse(self.b.bootstrap(config))
+        self.assertEqual(mock_cancellable_subprocess_call.call_args_list[0][0][0],
+                         ['bar', '--arg1=val1', '--scope=batman', '--datadir=' + os.path.join('data', 'test0')])
+
+        mock_cancellable_subprocess_call.reset_mock()
+        config['foo']['no_params'] = 1
+        self.assertFalse(self.b.bootstrap(config))
+        self.assertEqual(mock_cancellable_subprocess_call.call_args_list[0][0][0], ['bar', '--arg1=val1'])
 
         mock_cancellable_subprocess_call.return_value = 0
         with patch('multiprocessing.Process', Mock(side_effect=Exception("42"))), \
@@ -228,8 +257,9 @@ class TestBootstrap(BaseTestPostgresql):
         self.assertTrue(task.result)
 
         self.b.bootstrap(config)
-        with patch.object(Postgresql, 'pending_restart', PropertyMock(return_value=True)), \
-                patch.object(Postgresql, 'restart', Mock()) as mock_restart:
+        with patch.object(Postgresql, 'pending_restart_reason',
+                          PropertyMock(CaseInsensitiveDict({'max_connections': get_param_diff('200', '100')}))), \
+             patch.object(Postgresql, 'restart', Mock()) as mock_restart:
             self.b.post_bootstrap({}, task)
             mock_restart.assert_called_once()
 
@@ -238,7 +268,8 @@ class TestBootstrap(BaseTestPostgresql):
         self.p.reload_config({'authentication': {'superuser': {'username': 'p', 'password': 'p'},
                                                  'replication': {'username': 'r', 'password': 'r'},
                                                  'rewind': {'username': 'rw', 'password': 'rw'}},
-                              'listen': '*', 'retry_timeout': 10, 'parameters': {'wal_level': '', 'hba_file': 'foo'}})
+                              'listen': '*', 'retry_timeout': 10,
+                              'parameters': {'wal_level': '', 'hba_file': 'foo', 'max_prepared_transactions': 10}})
         with patch.object(Postgresql, 'major_version', PropertyMock(return_value=110000)), \
                 patch.object(Postgresql, 'restart', Mock()) as mock_restart:
             self.b.post_bootstrap({}, task)
@@ -255,7 +286,7 @@ class TestBootstrap(BaseTestPostgresql):
         mock_cancellable_subprocess_call.assert_called()
         args, kwargs = mock_cancellable_subprocess_call.call_args
         self.assertTrue('PGPASSFILE' in kwargs['env'])
-        self.assertEqual(args[0], ['/bin/false', 'dbname=postgres host=127.0.0.2 port=5432'])
+        self.assertEqual(args[0], ['/bin/false', 'dbname=postgres host=/tmp port=5432'])
 
         mock_cancellable_subprocess_call.reset_mock()
         self.p.connection_pool._conn_kwargs.pop('host')

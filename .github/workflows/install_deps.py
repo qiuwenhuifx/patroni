@@ -9,6 +9,11 @@ import zipfile
 
 
 def install_requirements(what):
+    subprocess.call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'])
+    s = subprocess.call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'wheel', 'setuptools'])
+    if s != 0:
+        return s
+
     old_path = sys.path[:]
     w = os.path.join(os.getcwd(), os.path.dirname(inspect.getfile(inspect.currentframe())))
     sys.path.insert(0, os.path.dirname(os.path.dirname(w)))
@@ -28,11 +33,7 @@ def install_requirements(what):
             if not extras or what == 'all' or what in extras:
                 requirements.append(r)
 
-    subprocess.call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'pip'])
-    subprocess.call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'wheel'])
-    r = subprocess.call([sys.executable, '-m', 'pip', 'install'] + requirements)
-    s = subprocess.call([sys.executable, '-m', 'pip', 'install', '--upgrade', 'setuptools'])
-    return s | r
+    return subprocess.call([sys.executable, '-m', 'pip', 'install'] + requirements)
 
 
 def install_packages(what):
@@ -46,7 +47,7 @@ def install_packages(what):
     packages = packages.get(what, [])
     ver = versions.get(what)
     if float(ver) >= 15:
-        packages += ['postgresql-{0}-citus-11.2'.format(ver)]
+        packages += ['postgresql-{0}-citus-12.1'.format(ver)]
     subprocess.call(['sudo', 'apt-get', 'update', '-y'])
     return subprocess.call(['sudo', 'apt-get', 'install', '-y', 'postgresql-' + ver, 'expect-dev'] + packages)
 
@@ -110,7 +111,7 @@ def install_etcd():
 
 
 def install_postgres():
-    version = os.environ.get('PGVERSION', '15.1-1')
+    version = os.environ.get('PGVERSION', '16.1-1')
     platform = {'darwin': 'osx', 'win32': 'windows-x64', 'cygwin': 'windows-x64'}[sys.platform]
     if platform == 'osx':
         return subprocess.call(['brew', 'install', 'expect', 'postgresql@{0}'.format(version.split('.')[0])])

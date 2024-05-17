@@ -15,9 +15,10 @@ from urllib3.exceptions import HTTPError
 from urllib.parse import urlencode, urlparse, quote
 from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Union, Tuple, TYPE_CHECKING
 
-from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, SyncState, \
-    TimelineHistory, ReturnFalseException, catch_return_false_exception, citus_group_re
+from . import AbstractDCS, Cluster, ClusterConfig, Failover, Leader, Member, Status, SyncState, \
+    TimelineHistory, ReturnFalseException, catch_return_false_exception
 from ..exceptions import DCSError
+from ..postgresql.mpp import AbstractMPP
 from ..utils import deep_compare, parse_bool, Retry, RetryFailedError, split_host_port, uri, USER_AGENT
 if TYPE_CHECKING:  # pragma: no cover
     from ..config import Config
@@ -232,8 +233,8 @@ def service_name_from_scope_name(scope_name: str) -> str:
 
 class Consul(AbstractDCS):
 
-    def __init__(self, config: Dict[str, Any]) -> None:
-        super(Consul, self).__init__(config)
+    def __init__(self, config: Dict[str, Any], mpp: AbstractMPP) -> None:
+        super(Consul, self).__init__(config, mpp)
         self._base_path = self._base_path[1:]
         self._scope = config['scope']
         self._session = None
@@ -383,23 +384,8 @@ class Consul(AbstractDCS):
         history = history and TimelineHistory.from_node(history['ModifyIndex'], history['Value'])
 
         # get last known leader lsn and slots
-        status = nodes.get(self._STATUS)
-        if status:
-            try:
-                status = json.loads(status['Value'])
-                last_lsn = status.get(self._OPTIME)
-                slots = status.get('slots')
-            except Exception:
-                slots = last_lsn = None
-        else:
-            last_lsn = nodes.get(self._LEADER_OPTIME)
-            last_lsn = last_lsn and last_lsn['Value']
-            slots = None
-
-        try:
-            last_lsn = int(last_lsn or '')
-        except Exception:
-            last_lsn = 0
+        status = nodes.get(self._STATUS) or nodes.get(self._LEADER_OPTIME)
+        status = Status.from_node(status and status['Value'])
 
         # get list of members
         members = [self.member(n) for k, n in nodes.items() if k.startswith(self._MEMBERS) and k.count('/') == 1]
@@ -428,29 +414,42 @@ class Consul(AbstractDCS):
         except Exception:
             failsafe = None
 
-        return Cluster(initialize, config, leader, last_lsn, members, failover, sync, history, slots, failsafe)
+        return Cluster(initialize, config, leader, status, members, failover, sync, history, failsafe)
 
     @property
     def _consistency(self) -> str:
         return 'consistent' if self._ctl else self._client.consistency
 
-    def _cluster_loader(self, path: str) -> Cluster:
+    def _postgresql_cluster_loader(self, path: str) -> Cluster:
+        """Load and build the :class:`Cluster` object from DCS, which represents a single PostgreSQL cluster.
+
+        :param path: the path in DCS where to load :class:`Cluster` from.
+
+        :returns: :class:`Cluster` instance.
+        """
         _, results = self.retry(self._client.kv.get, path, recurse=True, consistency=self._consistency)
         if results is None:
-            raise NotFound
-        nodes = {}
+            return Cluster.empty()
+        nodes: Dict[str, Dict[str, Any]] = {}
         for node in results:
             node['Value'] = (node['Value'] or b'').decode('utf-8')
             nodes[node['Key'][len(path):]] = node
 
         return self._cluster_from_nodes(nodes)
 
-    def _citus_cluster_loader(self, path: str) -> Dict[int, Cluster]:
+    def _mpp_cluster_loader(self, path: str) -> Dict[int, Cluster]:
+        """Load and build all PostgreSQL clusters from a single MPP cluster.
+
+        :param path: the path in DCS where to load Cluster(s) from.
+
+        :returns: all MPP groups as :class:`dict`, with group IDs as keys and :class:`Cluster` objects as values.
+        """
+        results: Optional[List[Dict[str, Any]]]
         _, results = self.retry(self._client.kv.get, path, recurse=True, consistency=self._consistency)
-        clusters: Dict[int, Dict[str, Cluster]] = defaultdict(dict)
+        clusters: Dict[int, Dict[str, Dict[str, Any]]] = defaultdict(dict)
         for node in results or []:
             key = node['Key'][len(path):].split('/', 1)
-            if len(key) == 2 and citus_group_re.match(key[0]):
+            if len(key) == 2 and self._mpp.group_re.match(key[0]):
                 node['Value'] = (node['Value'] or b'').decode('utf-8')
                 clusters[int(key[0])][key[1]] = node
         return {group: self._cluster_from_nodes(nodes) for group, nodes in clusters.items()}
@@ -460,8 +459,6 @@ class Consul(AbstractDCS):
     ) -> Union[Cluster, Dict[int, Cluster]]:
         try:
             return loader(path)
-        except NotFound:
-            return Cluster.empty()
         except Exception:
             logger.exception('get_cluster')
             raise ConsulError('Consul is not responding properly')
@@ -581,14 +578,17 @@ class Consul(AbstractDCS):
         try:
             return retry(self._client.kv.put, self.leader_path, self._name, acquire=self._session)
         except InvalidSession:
-            logger.error('Our session disappeared from Consul. Will try to get a new one and retry attempt')
             self._session = None
-            retry.ensure_deadline(0)
+
+            if not retry.ensure_deadline(0):
+                logger.error('Our session disappeared from Consul. Deadline exceeded, giving up')
+                return False
+
+            logger.error('Our session disappeared from Consul. Will try to get a new one and retry attempt')
 
             retry(self._do_refresh_session)
 
             retry.ensure_deadline(1, ConsulError('_do_attempt_to_acquire_leader timeout'))
-
             return retry(self._client.kv.put, self.leader_path, self._name, acquire=self._session)
 
     @catch_return_false_exception
@@ -683,7 +683,7 @@ class Consul(AbstractDCS):
         if ret:  # We have no other choise, only read after write :(
             if not retry.ensure_deadline(0.5):
                 return False
-            _, ret = self.retry(self._client.kv.get, self.sync_path)
+            _, ret = self.retry(self._client.kv.get, self.sync_path, consistency='consistent')
             if ret and (ret.get('Value') or b'').decode('utf-8') == value:
                 return ret['ModifyIndex']
         return False
